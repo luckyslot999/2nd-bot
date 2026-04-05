@@ -1,0 +1,14 @@
+{
+  "name": "w-broadcaster-bot",
+  "version": "1.0.0",
+  "description": "Multi-Device WhatsApp SaaS Broadcaster",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "pino": "^8.19.0",
+    "dotenv": "^16.4.5"
+  }
+}
