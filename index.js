@@ -13,7 +13,10 @@ async function fbGet(path) {
     try {
         const res = await fetch(`${FIREBASE_URL}/${path}.json`);
         return await res.json();
-    } catch (e) { return null; }
+    } catch (e) { 
+        console.error(`Firebase Read Error on ${path}:`, e.message);
+        return null; 
+    }
 }
 
 async function fbPatch(path, data) {
@@ -23,7 +26,7 @@ async function fbPatch(path, data) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         });
-    } catch (e) { console.error(`Firebase Update Error:`, e); }
+    } catch (e) { console.error(`Firebase Update Error:`, e.message); }
 }
 
 // ==========================================
@@ -31,23 +34,20 @@ async function fbPatch(path, data) {
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
-    // اب ہم Min اور Max ڈیلے استعمال کریں گے تاکہ روبوٹک نہ لگے
     return data || { 
         messageTemplate: "Hello, this is a test from SaaS Broadcaster!", 
         dailyLimitPerDevice: 35, 
-        minDelayMinutes: 12, // کم از کم 12 منٹ
-        maxDelayMinutes: 20  // زیادہ سے زیادہ 20 منٹ
+        minDelayMinutes: 12, 
+        maxDelayMinutes: 20  
     };
 }
 
-// رینڈم ٹائم جنریٹر (روبوٹک بیہیویئر ختم کرنے کے لیے)
 function getRandomDelayMs(minMinutes, maxMinutes) {
     const min = minMinutes * 60 * 1000;
     const max = maxMinutes * 60 * 1000;
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// رات 12 بجے تک کا ٹائم کیلکولیٹ کریں (تاکہ لمٹ پوری ہونے پر ڈیوائس سو جائے)
 function getMsUntilMidnight() {
     const now = new Date();
     const midnight = new Date(now);
@@ -116,13 +116,12 @@ function formatNumber(phone) {
 // 🚀 ANTI-BAN BROADCAST WORKER
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
-    console.log(`[${deviceId}] 🟢 Worker activated!`);
+    console.log(`[${deviceId}] 🟢 Broadcast Worker activated!`);
     
     const runWorker = async () => {
         try {
             const settings = await getSettings();
             
-            // 1. چیک کریں کہ آج کی لمٹ تو پوری نہیں ہو گئی؟
             const canSend = await checkAndUpdateDeviceLimit(deviceId, settings.dailyLimitPerDevice);
             if (!canSend) {
                 const sleepTimeMs = getMsUntilMidnight();
@@ -135,7 +134,7 @@ async function startBroadcastWorker(sock, deviceId) {
             let rawPhone = await getAndLockPendingNumber(deviceId);
             
             if (!rawPhone) {
-                console.log(`[${deviceId}] 📂 No numbers right now. Checking in 2 mins...`);
+                // console.log(`[${deviceId}] 📂 No numbers right now. Checking in 2 mins...`);
                 setTimeout(runWorker, 2 * 60 * 1000);
                 return;
             }
@@ -143,7 +142,6 @@ async function startBroadcastWorker(sock, deviceId) {
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
-            // 2. WhatsApp ویلیڈیشن
             const [waResult] = await sock.onWhatsApp(jid);
             if (!waResult?.exists) {
                 console.log(`[${deviceId}] ❌ Invalid number: ${phone}.`);
@@ -152,18 +150,15 @@ async function startBroadcastWorker(sock, deviceId) {
                 return;
             }
             
-            // 🔥 3. ANTI-BAN FEATURE: ٹائپنگ شو کریں (Human Behavior)
             console.log(`[${deviceId}] ✍️ Emulating typing for ${phone}...`);
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate('composing', jid);
             
-            // 3 سے 6 سیکنڈ کا رینڈم ٹائم ٹائپنگ کے لیے
             const typingTime = Math.floor(Math.random() * (6000 - 3000 + 1)) + 3000;
             await new Promise(resolve => setTimeout(resolve, typingTime));
             
             await sock.sendPresenceUpdate('paused', jid);
             
-            // 4. میسج سینڈ کریں
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
             await fbPatch(`numbers/${rawPhone}`, { 
@@ -171,10 +166,9 @@ async function startBroadcastWorker(sock, deviceId) {
             });
             console.log(`[${deviceId}] ✅ Sent successfully to: ${phone}`);
             
-            // 🔥 5. ANTI-BAN FEATURE: Random Delay (رینڈم ڈیلے)
             const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
-            console.log(`[${deviceId}] ⏳ Anti-Ban Delay: Waiting for ${delayMinutesDisplay} minutes before next message...`);
+            console.log(`[${deviceId}] ⏳ Anti-Ban Delay: Waiting for ${delayMinutesDisplay} minutes...`);
             
             setTimeout(runWorker, delayMs);
             
@@ -188,11 +182,13 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DEVICE MANAGER & POLLING
+// 📱 DEVICE MANAGER (QR & PAIRING CODE)
 // ==========================================
-async function startDevice(deviceId) {
+async function startDevice(deviceId, deviceData) {
     if (activeDevices.has(deviceId)) return;
     activeDevices.add(deviceId);
+
+    console.log(`[${deviceId}] 🔄 Initializing session...`);
 
     const sessionDir = `sessions_${deviceId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
@@ -200,35 +196,77 @@ async function startDevice(deviceId) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
-    const sock = makeWASocket({
-        version, auth: state, printQRInTerminal: true,
-        logger: pino({ level: 'silent' }),
-        browser: [`SaaS Broadcaster`, "Chrome", "1.0"]
-    });
+    // Check if user wants to use Pairing Code (If pairingNumber exists in Firebase)
+    const usePairingCode = !!deviceData.pairingNumber;
     
+    const sock = makeWASocket({
+        version, 
+        auth: state, 
+        printQRInTerminal: !usePairingCode, // Print QR only if NOT using pairing code
+        logger: pino({ level: 'silent' }),
+        // For pairing code, Baileys requires a specific browser signature
+        browser: usePairingCode ? ["Ubuntu", "Chrome", "20.0.04"] : [`SaaS Broadcaster`, "Chrome", "1.0"]
+    });
+
+    // 🔢 GENERATE PAIRING CODE
+    if (usePairingCode && !sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                console.log(`[${deviceId}] ⏳ Requesting Pairing Code for: ${deviceData.pairingNumber}...`);
+                let code = await sock.requestPairingCode(deviceData.pairingNumber);
+                code = code?.match(/.{1,4}/g)?.join("-") || code; // Format: ABCD-EFGH
+                console.log(`\n============================================`);
+                console.log(`[${deviceId}] 🔢 YOUR PAIRING CODE: ${code}`);
+                console.log(`============================================\n`);
+                
+                // Save code to Firebase so you can see it in your Web Panel
+                await fbPatch(`devices/${deviceId}`, { 
+                    status: 'awaiting_pairing', 
+                    pairingCode: code,
+                    qrLink: null 
+                });
+            } catch (err) {
+                console.error(`[${deviceId}] ❌ Failed to get Pairing Code:`, err.message);
+            }
+        }, 3000);
+    }
+
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        if (qr) {
+        // 📷 GENERATE QR CODE (If pairing code is not used)
+        if (qr && !usePairingCode) {
+            console.log(`[${deviceId}] 📷 QR Code Generated! Scan it now.`);
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            await fbPatch(`devices/${deviceId}`, { status: 'qr_ready', qrLink: qrImageUrl });
+            await fbPatch(`devices/${deviceId}`, { 
+                status: 'qr_ready', 
+                qrLink: qrImageUrl,
+                pairingCode: null 
+            });
         }
         
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
-            console.log(`✅ [${deviceId}] CONNECTED AS ${botNumber}`);
-            await fbPatch(`devices/${deviceId}`, { status: 'connected', phone: botNumber, qrLink: null });
+            console.log(`✅ [${deviceId}] SUCCESSFULLY CONNECTED AS ${botNumber}`);
+            await fbPatch(`devices/${deviceId}`, { 
+                status: 'connected', 
+                phone: botNumber, 
+                qrLink: null,
+                pairingCode: null 
+            });
             startBroadcastWorker(sock, deviceId);
         }
         
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
+            console.log(`[${deviceId}] ⚠️ Disconnected. Reason: ${reason}`);
             await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
 
             if (reason !== DisconnectReason.loggedOut) {
                 activeDevices.delete(deviceId);
-                setTimeout(() => startDevice(deviceId), 5000);
+                setTimeout(() => startDevice(deviceId, deviceData), 5000); // Reconnect auto
             } else {
+                console.log(`[${deviceId}] ❌ Logged out. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 activeDevices.delete(deviceId);
             }
@@ -238,18 +276,31 @@ async function startDevice(deviceId) {
     sock.ev.on('creds.update', saveCreds);
 }
 
+// ==========================================
+// 🔄 SYSTEM POLLING (MAIN LOOP)
+// ==========================================
 async function pollFirebaseForDevices() {
-    console.log("🚀 Starting System with Anti-Ban Logic...");
+    console.log("🚀 Starting System with Multi-Device & Pairing Code Logic...");
+    
     setInterval(async () => {
         const devices = await fbGet('devices');
-        if (!devices) return;
-        for (const deviceId in devices) {
+        if (!devices) {
+            // Uncomment line below if you want to see polling status in GitHub Actions
+            // console.log("⏳ Waiting for devices in Firebase..."); 
+            return;
+        }
+        
+        for (const [deviceId, deviceData] of Object.entries(devices)) {
             if (!activeDevices.has(deviceId)) {
-                startDevice(deviceId);
+                startDevice(deviceId, deviceData);
             }
         }
-    }, 10000);
+    }, 10000); // Checks every 10 seconds
 }
 
-if (!FIREBASE_URL) { process.exit(1); }
+if (!FIREBASE_URL) { 
+    console.error("❌ FIREBASE_URL is missing in .env file!");
+    process.exit(1); 
+}
+
 pollFirebaseForDevices();
