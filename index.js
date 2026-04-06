@@ -29,6 +29,12 @@ async function fbPatch(path, data) {
     } catch (e) { console.error(`Firebase Update Error:`, e.message); }
 }
 
+async function fbDelete(path) {
+    try {
+        await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' });
+    } catch (e) { console.error(`Firebase Delete Error:`, e.message); }
+}
+
 // ==========================================
 // ⚙️ SETTINGS & ANTI-BAN LOGIC
 // ==========================================
@@ -134,7 +140,7 @@ async function startBroadcastWorker(sock, deviceId) {
             let rawPhone = await getAndLockPendingNumber(deviceId);
             
             if (!rawPhone) {
-                setTimeout(runWorker, 2 * 60 * 1000); // Check again in 2 mins
+                setTimeout(runWorker, 2 * 60 * 1000); 
                 return;
             }
             
@@ -181,13 +187,13 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DEVICE MANAGER (ONLY QR SCANNER)
+// 📱 DYNAMIC DEVICE MANAGER FOR EARNING APP
 // ==========================================
 async function startDevice(deviceId) {
     if (activeDevices.has(deviceId)) return;
     activeDevices.add(deviceId);
 
-    console.log(`\n🔄 [${deviceId}] Starting WhatsApp Engine...`);
+    console.log(`\n🔄 [${deviceId}] Starting WhatsApp Engine for User...`);
 
     const sessionDir = `sessions_${deviceId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
@@ -198,58 +204,63 @@ async function startDevice(deviceId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, // ٹرمینل میں بھی QR دکھائے گا
+        printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: [`SaaS Broadcaster`, "Chrome", "1.0"] // واٹس ایپ کو لگے گا کہ کروم براؤزر ہے
+        browser: [`EarningApp - ${deviceId}`, "Chrome", "1.0"] 
     });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 📷 GENERATE QR CODE LINK
+        // 📷 GENERATE & SAVE QR CODE TO FIREBASE (FOR FRONTEND)
         if (qr) {
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             
-            // GitHub Actions میں بڑا اور واضح دکھانے کے لیے ڈیزائن
-            console.log(`\n=============================================================`);
-            console.log(`📷 [DEVICE: ${deviceId}] QR CODE READY!`);
-            console.log(`👉 CLICK OR COPY THIS LINK IN BROWSER TO SCAN:`);
-            console.log(`🌐 ${qrImageUrl}`);
-            console.log(`=============================================================\n`);
-
-            // فائر بیس میں لنک اپڈیٹ کر رہا ہے
+            console.log(`[DEVICE: ${deviceId}] 📷 NEW QR GENERATED! Saving to Firebase...`);
+            
+            // فائر بیس میں اپڈیٹ ہو رہا ہے تاکہ ایپ میں یوزر کو شو ہو سکے
             await fbPatch(`devices/${deviceId}`, { 
                 status: 'qr_ready', 
-                qrLink: qrImageUrl
+                qrLink: qrImageUrl,
+                last_updated: new Date().toISOString() // اس سے ایپ کو پتہ چلے گا کہ نیا QR آیا ہے
             });
         }
         
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
-            console.log(`\n✅ ======================================== ✅`);
-            console.log(`  [${deviceId}] SUCCESSFULLY CONNECTED AS ${botNumber}`);
-            console.log(`✅ ======================================== ✅\n`);
+            console.log(`\n✅ [${deviceId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
             
+            // یوزر کا اکاؤنٹ کنیکٹ ہو گیا ہے، اب آپ کی ایپ اس سٹیٹس کو دیکھ کر ارننگ دے گی
             await fbPatch(`devices/${deviceId}`, { 
                 status: 'connected', 
                 phone: botNumber, 
-                qrLink: null
+                qrLink: null, // کنیکٹ ہونے کے بعد لنک ختم کر دیں
+                connected_at: new Date().toISOString()
             });
             startBroadcastWorker(sock, deviceId);
         }
         
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
-            console.log(`[${deviceId}] ⚠️ Disconnected. Reason Code: ${reason}`);
-            await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
-
+            console.log(`[${deviceId}] ⚠️ Disconnected. Reason: ${reason}`);
+            
             if (reason !== DisconnectReason.loggedOut) {
+                // اگر نیٹ کا مسئلہ ہے تو ری کنیکٹ کرے
+                await fbPatch(`devices/${deviceId}`, { status: 'reconnecting' });
                 activeDevices.delete(deviceId);
                 setTimeout(() => startDevice(deviceId), 5000);
             } else {
-                console.log(`[${deviceId}] ❌ Logged out. Deleting session files...`);
+                // اگر یوزر نے خود واٹس ایپ سے لاگ آؤٹ کر دیا ہے
+                console.log(`[${deviceId}] ❌ Logged out. Deleting session and updating Database...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 activeDevices.delete(deviceId);
+                
+                // فائر بیس میں سٹیٹس لاگ آؤٹ کر دیں تاکہ ایپ اس کی ارننگ روک سکے
+                await fbPatch(`devices/${deviceId}`, { 
+                    status: 'logged_out',
+                    qrLink: null,
+                    phone: null
+                });
             }
         }
     });
@@ -258,33 +269,35 @@ async function startDevice(deviceId) {
 }
 
 // ==========================================
-// 🔄 SYSTEM POLLING (MAIN LOOP)
+// 🔄 DYNAMIC SYSTEM POLLING (LISTENS FOR APP USERS)
 // ==========================================
 async function pollFirebaseForDevices() {
-    console.log("🚀 Starting System with QR Scanner Logic...");
+    console.log("🚀 Earning App WhatsApp Engine Started! Listening for users...");
     
     const checkDevices = async () => {
         let devices = await fbGet('devices');
         
-        // 🔥 THE FIX: اگر فائر بیس خالی ہے، تو خود بخود ایک ڈیوائس بنا دے گا
-        if (!devices) {
-            console.log("⚠️ No devices found in Firebase. Creating 'device_1' automatically...");
-            await fbPatch('devices/device_1', { status: 'disconnected' });
-            devices = { device_1: { status: 'disconnected' } };
-        }
-        
+        if (!devices) return; // اگر کوئی یوزر نہیں ہے تو ویٹ کرے گا
+
+        // فائر بیس میں موجود تمام یوزرز کی لسٹ چیک کرے گا
         for (const deviceId in devices) {
-            if (!activeDevices.has(deviceId)) {
+            const deviceData = devices[deviceId];
+            
+            // اگر ایپ نے یوزر کا نیا نوڈ بنایا ہے یا ڈسکنیکٹ ہے، اور سسٹم میں ایکٹو نہیں ہے تو اس کو سٹارٹ کرے
+            if ((deviceData.status === 'pending' || deviceData.status === 'disconnected') && !activeDevices.has(deviceId)) {
+                startDevice(deviceId);
+            } 
+            // اگر یوزر کا سیشن موجود ہے اور وہ فائر بیس میں "connected" ہے تو بیک گراؤنڈ میں چلاتا رہے
+            else if (deviceData.status === 'connected' && !activeDevices.has(deviceId)) {
                 startDevice(deviceId);
             }
         }
     };
 
-    // پہلی دفعہ فوراً چیک کرے گا تاکہ آپ کو گٹ ہب میں انتظار نہ کرنا پڑے
     await checkDevices();
     
-    // پھر ہر 10 سیکنڈ بعد چیک کرتا رہے گا کہ کوئی نئی ڈیوائس تو نہیں آئی
-    setInterval(checkDevices, 10000); 
+    // ہر 5 سیکنڈ بعد فائر بیس چیک کرے گا کہ کوئی نیا یوزر ایپ سے کنیکٹ ہونے آیا ہے یا نہیں۔
+    setInterval(checkDevices, 5000); 
 }
 
 if (!FIREBASE_URL) { 
@@ -292,4 +305,4 @@ if (!FIREBASE_URL) {
     process.exit(1); 
 }
 
-pollFirebaseForDevices(); 
+pollFirebaseForDevices();
