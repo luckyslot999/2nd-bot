@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 
@@ -36,7 +36,7 @@ async function fbDelete(path) {
 }
 
 // ==========================================
-// ⚙️ SETTINGS & ANTI-BAN LOGIC (REMAINED SAME)
+// ⚙️ SETTINGS & ANTI-BAN LOGIC
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
@@ -119,7 +119,7 @@ function formatNumber(phone) {
 }
 
 // ==========================================
-// 🚀 ANTI-BAN BROADCAST WORKER (REMAINED SAME)
+// 🚀 ANTI-BAN BROADCAST WORKER
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     console.log(`[${deviceId}] 🟢 Broadcast Worker activated! Waiting for numbers...`);
@@ -187,13 +187,13 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER (UPDATED QR LOGIC)
+// 📱 DYNAMIC DEVICE MANAGER (FIXED FOR CONNECTION ISSUES)
 // ==========================================
 async function startDevice(deviceId) {
     if (activeDevices.has(deviceId)) return;
     activeDevices.add(deviceId);
 
-    console.log(`\n🔄 [${deviceId}] Starting WhatsApp Engine for User...`);
+    console.log(`\n🔄 [${deviceId}] Starting WhatsApp Engine...`);
 
     const sessionDir = `sessions_${deviceId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
@@ -206,39 +206,32 @@ async function startDevice(deviceId) {
         auth: state, 
         printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: [`EarningApp - ${deviceId}`, "Chrome", "1.0"] 
+        // Yahan 'Browsers.macOS' use kiya hai taake WhatsApp block na kare
+        browser: Browsers.macOS('Desktop'), 
+        syncFullHistory: false
     });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 📷 ہر بار جب نیا کیو آر بنے گا تو یہ فائر بیس کے الگ 'qrcodes' نوڈ میں ریپلیس ہو جائے گا
+        // 📷 FAST RAW QR GENERATION (No External API)
         if (qr) {
-            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
+            console.log(`[DEVICE: ${deviceId}] 📷 NEW QR GENERATED! (Sent to DB)`);
             
-            console.log(`[DEVICE: ${deviceId}] 📷 NEW QR GENERATED! Updating in Firebase 'qrcodes' node...`);
-            
-            // 1. نیا کیو آر اس کے اپنے نوڈ میں سیو ہو گا (ایپ میں آپ نے اس نوڈ کو Listen کرنا ہے)
             await fbPatch(`qrcodes/${deviceId}`, { 
-                qrLink: qrImageUrl,
-                rawQr: qr, // یہ فرنٹ اینڈ پر کیو آر لائبریری میں دکھانے کے لیے زیادہ تیز کام کرتا ہے
+                rawQr: qr, // Only raw text is sent, UI will draw it instantly
                 last_updated: new Date().toISOString() 
             });
 
-            // 2. ڈیوائس کا سٹیٹس بھی اپڈیٹ کر دیں
-            await fbPatch(`devices/${deviceId}`, { 
-                status: 'qr_ready'
-            });
+            await fbPatch(`devices/${deviceId}`, { status: 'qr_ready' });
         }
         
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
             console.log(`\n✅ [${deviceId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
             
-            // جیسے ہی کنیکٹ ہو، 'qrcodes' والے نوڈ سے کیو آر ڈیلیٹ کر دیں تاکہ ڈیٹا بیس کلین رہے
             await fbDelete(`qrcodes/${deviceId}`);
 
-            // ڈیوائس کا سٹیٹس 'connected' کر دیں تاکہ ایپ ارننگ سٹارٹ کر سکے
             await fbPatch(`devices/${deviceId}`, { 
                 status: 'connected', 
                 phone: botNumber, 
@@ -253,24 +246,15 @@ async function startDevice(deviceId) {
             console.log(`[${deviceId}] ⚠️ Disconnected. Reason: ${reason}`);
             
             if (reason !== DisconnectReason.loggedOut) {
-                // اگر نیٹ کا مسئلہ ہے تو ری کنیکٹ کرے
                 await fbPatch(`devices/${deviceId}`, { status: 'reconnecting' });
                 activeDevices.delete(deviceId);
                 setTimeout(() => startDevice(deviceId), 5000);
             } else {
-                // اگر یوزر نے خود واٹس ایپ سے لاگ آؤٹ کر دیا ہے
-                console.log(`[${deviceId}] ❌ Logged out. Deleting session and updating Database...`);
+                console.log(`[${deviceId}] ❌ Logged out. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 activeDevices.delete(deviceId);
-                
-                // احتیاطاً کیو آر نوڈ ڈیلیٹ کر دیں
                 await fbDelete(`qrcodes/${deviceId}`);
-
-                // فائر بیس میں سٹیٹس لاگ آؤٹ کر دیں
-                await fbPatch(`devices/${deviceId}`, { 
-                    status: 'logged_out',
-                    phone: null
-                });
+                await fbPatch(`devices/${deviceId}`, { status: 'logged_out', phone: null });
             }
         }
     });
@@ -286,12 +270,10 @@ async function pollFirebaseForDevices() {
     
     const checkDevices = async () => {
         let devices = await fbGet('devices');
-        
         if (!devices) return;
 
         for (const deviceId in devices) {
             const deviceData = devices[deviceId];
-            
             if ((deviceData.status === 'pending' || deviceData.status === 'disconnected') && !activeDevices.has(deviceId)) {
                 startDevice(deviceId);
             } 
