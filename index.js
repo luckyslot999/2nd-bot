@@ -40,11 +40,12 @@ async function fbDelete(path) {
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
+    // یہاں 10 سے 15 منٹ کا ٹائم فکس کر دیا گیا ہے تاکہ بین نہ ہو
     return data || { 
         messageTemplate: "Hello, this is a test from SaaS Broadcaster!", 
         dailyLimitPerDevice: 35, 
-        minDelayMinutes: 12, 
-        maxDelayMinutes: 20  
+        minDelayMinutes: 10,  // 10 منٹ کم از کم
+        maxDelayMinutes: 15   // 15 منٹ زیادہ سے زیادہ
     };
 }
 
@@ -171,9 +172,10 @@ async function startBroadcastWorker(sock, deviceId) {
             });
             console.log(`[${deviceId}] ✅ Sent successfully to: ${phone}`);
             
-            const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
+            // 🚨 یہاں لازمی 10 سے 15 منٹ کا انتظار ہوگا تاکہ بین نہ ہو
+            const delayMs = getRandomDelayMs(10, 15); 
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
-            console.log(`[${deviceId}] ⏳ Anti-Ban Delay: Waiting for ${delayMinutesDisplay} minutes...`);
+            console.log(`[${deviceId}] ⏳ Anti-Ban Delay: Waiting for ${delayMinutesDisplay} minutes before next message...`);
             
             setTimeout(runWorker, delayMs);
             
@@ -187,15 +189,15 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER (FIXED FOR CONNECTION ISSUES)
+// 📱 DYNAMIC DEVICE MANAGER (FIXED FOR PAIRING CODE)
 // ==========================================
-async function startDevice(deviceId) {
-    if (activeDevices.has(deviceId)) return;
-    activeDevices.add(deviceId);
+async function startDevice(phoneNumberId) {
+    if (activeDevices.has(phoneNumberId)) return;
+    activeDevices.add(phoneNumberId);
 
-    console.log(`\n🔄 [${deviceId}] Starting WhatsApp Engine...`);
+    console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
-    const sessionDir = `sessions_${deviceId}`;
+    const sessionDir = `sessions_${phoneNumberId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
     
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -204,57 +206,79 @@ async function startDevice(deviceId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, 
+        printQRInTerminal: false, // QR بند کر دیا گیا ہے کیونکہ اب 8 ہندسوں کا کوڈ چاہیے
         logger: pino({ level: 'silent' }),
-        // Yahan 'Browsers.macOS' use kiya hai taake WhatsApp block na kare
-        browser: Browsers.macOS('Desktop'), 
+        // پیئرنگ کوڈ کے لیے یہ براؤزر سیٹنگ لازمی ہوتی ہے
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], 
         syncFullHistory: false
     });
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        // 📷 FAST RAW QR GENERATION (No External API)
-        if (qr) {
-            console.log(`[DEVICE: ${deviceId}] 📷 NEW QR GENERATED! (Sent to DB)`);
-            
-            await fbPatch(`qrcodes/${deviceId}`, { 
-                rawQr: qr, // Only raw text is sent, UI will draw it instantly
-                last_updated: new Date().toISOString() 
-            });
+    // 🔑 8-DIGIT PAIRING CODE LOGIC
+    if (!sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                // اگر نمبر 03 سے شروع ہوتا ہے (جیسے پاکستان کا) تو اسے 923 میں تبدیل کریں 
+                // کیونکہ واٹس ایپ پیئرنگ کے لیے کنٹری کوڈ لازمی ہے
+                let formattedNumber = phoneNumberId;
+                if (formattedNumber.startsWith('0')) {
+                    formattedNumber = '92' + formattedNumber.substring(1);
+                }
 
-            await fbPatch(`devices/${deviceId}`, { status: 'qr_ready' });
-        }
+                console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for ${formattedNumber}...`);
+                const pairingCode = await sock.requestPairingCode(formattedNumber);
+                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
+
+                // فائر بیس میں کوڈ اپڈیٹ کریں تاکہ آپ کے فرنٹ اینڈ پینل پر شو ہو سکے
+                await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                    pairingCode: pairingCode,
+                    status: 'code_generated',
+                    last_updated: new Date().toISOString() 
+                });
+
+                await fbPatch(`devices/${phoneNumberId}`, { 
+                    status: 'pairing_code_ready',
+                    pairingCode: pairingCode 
+                });
+
+            } catch (err) {
+                console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+            }
+        }, 3000); // 3 سیکنڈ کا ڈیلے تاکہ سوکٹ صحیح سے انیشلائز ہو جائے
+    }
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
         
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
-            console.log(`\n✅ [${deviceId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
+            console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
             
-            await fbDelete(`qrcodes/${deviceId}`);
+            // کنیکٹ ہونے کے بعد bot_request ڈیلیٹ کر دیں تاکہ بار بار جنریٹ نہ ہو
+            await fbDelete(`bot_requests/${phoneNumberId}`);
 
-            await fbPatch(`devices/${deviceId}`, { 
+            await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: botNumber, 
                 connected_at: new Date().toISOString()
             });
             
-            startBroadcastWorker(sock, deviceId);
+            // براڈکاسٹ ورکر سٹارٹ کریں
+            startBroadcastWorker(sock, phoneNumberId);
         }
         
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
-            console.log(`[${deviceId}] ⚠️ Disconnected. Reason: ${reason}`);
+            console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
             if (reason !== DisconnectReason.loggedOut) {
-                await fbPatch(`devices/${deviceId}`, { status: 'reconnecting' });
-                activeDevices.delete(deviceId);
-                setTimeout(() => startDevice(deviceId), 5000);
+                await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
+                activeDevices.delete(phoneNumberId);
+                setTimeout(() => startDevice(phoneNumberId), 5000);
             } else {
-                console.log(`[${deviceId}] ❌ Logged out. Deleting session...`);
+                console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
-                activeDevices.delete(deviceId);
-                await fbDelete(`qrcodes/${deviceId}`);
-                await fbPatch(`devices/${deviceId}`, { status: 'logged_out', phone: null });
+                activeDevices.delete(phoneNumberId);
+                await fbPatch(`devices/${phoneNumberId}`, { status: 'logged_out', phone: null });
             }
         }
     });
@@ -263,28 +287,42 @@ async function startDevice(deviceId) {
 }
 
 // ==========================================
-// 🔄 DYNAMIC SYSTEM POLLING
+// 🔄 DYNAMIC SYSTEM POLLING (FOR REQUESTS & DEVICES)
 // ==========================================
 async function pollFirebaseForDevices() {
-    console.log("🚀 Earning App WhatsApp Engine Started! Listening for users...");
+    console.log("🚀 Earning App WhatsApp Engine Started! Listening for users & bot requests...");
     
-    const checkDevices = async () => {
-        let devices = await fbGet('devices');
-        if (!devices) return;
+    const checkSystem = async () => {
+        // 1. Check New Bot Requests (For Generating Pairing Code)
+        let requests = await fbGet('bot_requests');
+        if (requests) {
+            for (const phoneId in requests) {
+                const reqData = requests[phoneId];
+                if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'code_generated' && reqData.status !== 'processing') {
+                    // مارک ایز پروسیسنگ تاکہ لوپ بار بار ایک ہی نمبر کو ہٹ نہ کرے
+                    await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
+                    startDevice(phoneId);
+                }
+            }
+        }
 
-        for (const deviceId in devices) {
-            const deviceData = devices[deviceId];
-            if ((deviceData.status === 'pending' || deviceData.status === 'disconnected') && !activeDevices.has(deviceId)) {
-                startDevice(deviceId);
-            } 
-            else if (deviceData.status === 'connected' && !activeDevices.has(deviceId)) {
-                startDevice(deviceId);
+        // 2. Check Disconnected/Pending Devices to Restart
+        let devices = await fbGet('devices');
+        if (devices) {
+            for (const deviceId in devices) {
+                const deviceData = devices[deviceId];
+                if ((deviceData.status === 'pending' || deviceData.status === 'disconnected') && !activeDevices.has(deviceId)) {
+                    startDevice(deviceId);
+                } 
+                else if (deviceData.status === 'connected' && !activeDevices.has(deviceId)) {
+                    startDevice(deviceId);
+                }
             }
         }
     };
 
-    await checkDevices();
-    setInterval(checkDevices, 5000); 
+    await checkSystem();
+    setInterval(checkSystem, 5000); 
 }
 
 if (!FIREBASE_URL) { 
