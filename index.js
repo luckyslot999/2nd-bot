@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 
@@ -40,12 +40,11 @@ async function fbDelete(path) {
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
-    // یہاں 10 سے 15 منٹ کا ٹائم فکس کر دیا گیا ہے تاکہ بین نہ ہو
     return data || { 
         messageTemplate: "Hello, this is a test from SaaS Broadcaster!", 
         dailyLimitPerDevice: 35, 
-        minDelayMinutes: 10,  // 10 منٹ کم از کم
-        maxDelayMinutes: 15   // 15 منٹ زیادہ سے زیادہ
+        minDelayMinutes: 10,  // Anti-Ban: Minimum 10 minutes delay
+        maxDelayMinutes: 15   // Anti-Ban: Maximum 15 minutes delay
     };
 }
 
@@ -172,8 +171,8 @@ async function startBroadcastWorker(sock, deviceId) {
             });
             console.log(`[${deviceId}] ✅ Sent successfully to: ${phone}`);
             
-            // 🚨 یہاں لازمی 10 سے 15 منٹ کا انتظار ہوگا تاکہ بین نہ ہو
-            const delayMs = getRandomDelayMs(10, 15); 
+            // 🚨 10 to 15 Minutes Anti-Ban Delay
+            const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
             console.log(`[${deviceId}] ⏳ Anti-Ban Delay: Waiting for ${delayMinutesDisplay} minutes before next message...`);
             
@@ -189,13 +188,13 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER (FIXED FOR PAIRING CODE)
+// 📱 DYNAMIC DEVICE MANAGER (DUAL: QR + PAIRING CODE)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeDevices.has(phoneNumberId)) return;
     activeDevices.add(phoneNumberId);
 
-    console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
+    console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine (Generating QR & Code)...`);
 
     const sessionDir = `sessions_${phoneNumberId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
@@ -206,55 +205,74 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: false, // QR بند کر دیا گیا ہے کیونکہ اب 8 ہندسوں کا کوڈ چاہیے
+        printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        // پیئرنگ کوڈ کے لیے یہ براؤزر سیٹنگ لازمی ہوتی ہے
-        browser: ['Ubuntu', 'Chrome', '20.0.04'], 
-        syncFullHistory: false
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Chrome Browser is strict requirement for pairing code
+        syncFullHistory: false,
+        qrTimeout: 50000 // ⏳ QR Code Expiry set to 50 Seconds
     });
 
-    // 🔑 8-DIGIT PAIRING CODE LOGIC
-    if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
-                // اگر نمبر 03 سے شروع ہوتا ہے (جیسے پاکستان کا) تو اسے 923 میں تبدیل کریں 
-                // کیونکہ واٹس ایپ پیئرنگ کے لیے کنٹری کوڈ لازمی ہے
-                let formattedNumber = phoneNumberId;
-                if (formattedNumber.startsWith('0')) {
-                    formattedNumber = '92' + formattedNumber.substring(1);
-                }
-
-                console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for ${formattedNumber}...`);
-                const pairingCode = await sock.requestPairingCode(formattedNumber);
-                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
-
-                // فائر بیس میں کوڈ اپڈیٹ کریں تاکہ آپ کے فرنٹ اینڈ پینل پر شو ہو سکے
-                await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                    pairingCode: pairingCode,
-                    status: 'code_generated',
-                    last_updated: new Date().toISOString() 
-                });
-
-                await fbPatch(`devices/${phoneNumberId}`, { 
-                    status: 'pairing_code_ready',
-                    pairingCode: pairingCode 
-                });
-
-            } catch (err) {
-                console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
-            }
-        }, 3000); // 3 سیکنڈ کا ڈیلے تاکہ سوکٹ صحیح سے انیشلائز ہو جائے
-    }
+    let pairingCodeRequested = false;
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
         
+        // 📷 1. GENERATE QR CODE (Sent to DB)
+        if (qr) {
+            console.log(`[${phoneNumberId}] 📷 NEW QR GENERATED! (Expiry: 50s)`);
+            
+            // Updating Both Nodes for Flexibility
+            await fbPatch(`qrcodes/${phoneNumberId}`, { rawQr: qr, last_updated: new Date().toISOString() });
+            await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                qr: qr, 
+                status: 'waiting_for_scan_or_code',
+                last_updated: new Date().toISOString() 
+            });
+            await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
+
+            // 🔑 2. GENERATE PAIRING CODE (Run once after first QR generation)
+            if (!pairingCodeRequested && !sock.authState.creds.registered) {
+                pairingCodeRequested = true;
+                
+                setTimeout(async () => {
+                    try {
+                        // Formatting number properly for WhatsApp API (Must include country code like 92)
+                        let formattedNumber = phoneNumberId.replace(/\D/g, '');
+                        if (formattedNumber.startsWith('0')) {
+                            formattedNumber = '92' + formattedNumber.substring(1);
+                        }
+
+                        console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for exact number: ${formattedNumber}...`);
+                        const pairingCode = await sock.requestPairingCode(formattedNumber);
+                        
+                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
+
+                        // Send Pairing code to Firebase
+                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                            pairingCode: pairingCode,
+                            status: 'waiting_for_scan_or_code',
+                            last_updated: new Date().toISOString() 
+                        });
+
+                        await fbPatch(`devices/${phoneNumberId}`, { 
+                            pairingCode: pairingCode 
+                        });
+
+                    } catch (err) {
+                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+                    }
+                }, 2000); // Wait 2 seconds after QR to request code safely
+            }
+        }
+        
+        // ✅ ON SUCCESSFUL CONNECTION
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
             console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
             
-            // کنیکٹ ہونے کے بعد bot_request ڈیلیٹ کر دیں تاکہ بار بار جنریٹ نہ ہو
+            // Clean up requests & qrcodes from DB
             await fbDelete(`bot_requests/${phoneNumberId}`);
+            await fbDelete(`qrcodes/${phoneNumberId}`);
 
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
@@ -262,10 +280,10 @@ async function startDevice(phoneNumberId) {
                 connected_at: new Date().toISOString()
             });
             
-            // براڈکاسٹ ورکر سٹارٹ کریں
             startBroadcastWorker(sock, phoneNumberId);
         }
         
+        // ❌ ON DISCONNECT / LOGOUT
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
@@ -278,6 +296,8 @@ async function startDevice(phoneNumberId) {
                 console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 activeDevices.delete(phoneNumberId);
+                await fbDelete(`bot_requests/${phoneNumberId}`);
+                await fbDelete(`qrcodes/${phoneNumberId}`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'logged_out', phone: null });
             }
         }
@@ -287,19 +307,18 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🔄 DYNAMIC SYSTEM POLLING (FOR REQUESTS & DEVICES)
+// 🔄 DYNAMIC SYSTEM POLLING
 // ==========================================
 async function pollFirebaseForDevices() {
-    console.log("🚀 Earning App WhatsApp Engine Started! Listening for users & bot requests...");
+    console.log("🚀 WhatsApp Engine Started! Listening for users & bot requests...");
     
     const checkSystem = async () => {
-        // 1. Check New Bot Requests (For Generating Pairing Code)
+        // 1. Check New Bot Requests
         let requests = await fbGet('bot_requests');
         if (requests) {
             for (const phoneId in requests) {
                 const reqData = requests[phoneId];
-                if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'code_generated' && reqData.status !== 'processing') {
-                    // مارک ایز پروسیسنگ تاکہ لوپ بار بار ایک ہی نمبر کو ہٹ نہ کرے
+                if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
                     await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
                     startDevice(phoneId);
                 }
