@@ -1,3 +1,5 @@
+
+
 require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -237,18 +239,34 @@ async function startDevice(phoneNumberId) {
             });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
 
-            // 🔑 2. GENERATE 8-DIGIT PAIRING CODE
+            // 🔑 2. GENERATE 8-DIGIT PAIRING CODE (SMART INTERNATIONAL FORMATTING)
             if (!pairingCodeRequested && !sock.authState.creds.registered) {
                 pairingCodeRequested = true;
                 
                 setTimeout(async () => {
                     try {
-                        let formattedNumber = phoneNumberId.replace(/\D/g, '');
-                        if (formattedNumber.startsWith('0')) {
+                        let rawInput = phoneNumberId.toString().trim();
+                        // صرف نمبرز اور + کا نشان رہنے دیں باقی سب صاف کر دیں
+                        let formattedNumber = rawInput.replace(/[^0-9+]/g, '');
+                        
+                        if (formattedNumber.startsWith('+')) {
+                            // +92300... -> 92300...
+                            formattedNumber = formattedNumber.replace('+', '');
+                        } else if (formattedNumber.startsWith('00')) {
+                            // 0092300... -> 92300...
+                            formattedNumber = formattedNumber.substring(2);
+                        } else if (formattedNumber.startsWith('03') && formattedNumber.length === 11) {
+                            // پاکستان کا لوکل نمبر (03001234567) -> 923001234567
                             formattedNumber = '92' + formattedNumber.substring(1);
+                        } else if (formattedNumber.startsWith('0')) {
+                            // کسی دوسرے ملک کا لوکل نمبر ہو یا غلطی سے 0 لگایا ہو
+                            formattedNumber = formattedNumber.substring(1);
                         }
+                        
+                        // آخری بار صرف نمبرز کو محفوظ کریں تاکہ کوئی فالتو نشان نہ جائے
+                        formattedNumber = formattedNumber.replace(/\D/g, '');
 
-                        console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for exact number: ${formattedNumber}...`);
+                        console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for formatted exact number: ${formattedNumber}...`);
                         
                         const pairingCode = await sock.requestPairingCode(formattedNumber);
                         
@@ -357,4 +375,4 @@ if (!FIREBASE_URL) {
     process.exit(1); 
 }
 
-pollFirebaseForDevices();
+pollFirebaseForDevices();                        
