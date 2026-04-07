@@ -1,4 +1,4 @@
-require('dotenv').config();
+ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
@@ -188,13 +188,13 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER (DUAL: QR + PAIRING CODE)
+// 📱 DYNAMIC DEVICE MANAGER (QR LINK & PAIRING CODE)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeDevices.has(phoneNumberId)) return;
     activeDevices.add(phoneNumberId);
 
-    console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine (Generating QR & Code)...`);
+    console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
     const sessionDir = `sessions_${phoneNumberId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
@@ -207,7 +207,7 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Chrome Browser is strict requirement for pairing code
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Chrome Browser for Pairing Code Support
         syncFullHistory: false,
         qrTimeout: 50000 // ⏳ QR Code Expiry set to 50 Seconds
     });
@@ -217,51 +217,55 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 📷 1. GENERATE QR CODE (Sent to DB)
+        // 📷 1. GENERATE QR CODE LINK (API URL format)
         if (qr) {
-            console.log(`[${phoneNumberId}] 📷 NEW QR GENERATED! (Expiry: 50s)`);
+            // Encode the raw QR string and attach it to the API link
+            const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
+            console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED! (Expiry: 50s)`);
             
-            // Updating Both Nodes for Flexibility
-            await fbPatch(`qrcodes/${phoneNumberId}`, { rawQr: qr, last_updated: new Date().toISOString() });
+            // Updating Both Nodes for Flexibility in your Frontend
+            await fbPatch(`qrcodes/${phoneNumberId}`, { 
+                qr_link: qrApiLink, 
+                last_updated: new Date().toISOString() 
+            });
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qr: qr, 
+                qr: qrApiLink,  // Frontend will read this URL and show the image directly
                 status: 'waiting_for_scan_or_code',
                 last_updated: new Date().toISOString() 
             });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
 
-            // 🔑 2. GENERATE PAIRING CODE (Run once after first QR generation)
+            // 🔑 2. GENERATE 8-DIGIT PAIRING CODE (Fix for Pakistan numbers)
             if (!pairingCodeRequested && !sock.authState.creds.registered) {
                 pairingCodeRequested = true;
                 
                 setTimeout(async () => {
                     try {
-                        // Formatting number properly for WhatsApp API (Must include country code like 92)
+                        // Formatting number properly (converting 0301... to 92301...)
                         let formattedNumber = phoneNumberId.replace(/\D/g, '');
                         if (formattedNumber.startsWith('0')) {
                             formattedNumber = '92' + formattedNumber.substring(1);
                         }
 
                         console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for exact number: ${formattedNumber}...`);
+                        
+                        // Wait for WhatsApp to return the 8-digit code
                         const pairingCode = await sock.requestPairingCode(formattedNumber);
                         
                         console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
 
                         // Send Pairing code to Firebase
                         await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                            pairingCode: pairingCode,
+                            pairingCode: pairingCode, // Your frontend can show this 8-digit code
                             status: 'waiting_for_scan_or_code',
                             last_updated: new Date().toISOString() 
                         });
 
-                        await fbPatch(`devices/${phoneNumberId}`, { 
-                            pairingCode: pairingCode 
-                        });
-
                     } catch (err) {
-                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error (Code may not work for this number):`, err.message);
+                        // Even if code fails, QR link is already sent and will work perfectly.
                     }
-                }, 2000); // Wait 2 seconds after QR to request code safely
+                }, 3000); // 3-second delay to ensure socket is ready
             }
         }
         
@@ -349,4 +353,4 @@ if (!FIREBASE_URL) {
     process.exit(1); 
 }
 
-pollFirebaseForDevices();
+pollFirebaseForDevices();          
