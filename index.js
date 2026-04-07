@@ -1,7 +1,6 @@
-
-
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+// 🛠️ فکس 1: Browsers کو بھی امپورٹ کیا گیا ہے
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 
@@ -38,16 +37,15 @@ async function fbDelete(path) {
 }
 
 // ==========================================
-// ⚙️ SETTINGS & ANTI-BAN LOGIC (UPDATED)
+// ⚙️ SETTINGS & ANTI-BAN LOGIC
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
-    // ⚠️ ڈیلی لمٹ اور ٹائم کوڈ میں فکس کر دیا گیا ہے تاکہ اینٹی بین کام کر سکے
     return { 
         messageTemplate: data?.messageTemplate || "Hello, this is a message from Botzmine!", 
-        dailyLimitPerDevice: 35, // روزانہ 30 سے 35 میسجز کی لمٹ
-        minDelayMinutes: 15,     // کم از کم 15 منٹ کا وقفہ
-        maxDelayMinutes: 20      // زیادہ سے زیادہ 20 منٹ کا وقفہ
+        dailyLimitPerDevice: 35, 
+        minDelayMinutes: 15,     
+        maxDelayMinutes: 20      
     };
 }
 
@@ -93,7 +91,6 @@ async function getAndLockPendingNumber(deviceId) {
     return null;
 }
 
-// 📊 یہ فنکشن مخصوص ڈیوائس (نمبر) کا ڈیٹا ڈیٹا بیس میں اپڈیٹ کرتا ہے
 async function checkAndUpdateDeviceLimit(deviceId, maxLimit) {
     const today = new Date().toISOString().split('T')[0];
     let stats = await fbGet(`devices/${deviceId}`);
@@ -120,6 +117,22 @@ async function checkAndUpdateDeviceLimit(deviceId, maxLimit) {
 
 function formatNumber(phone) {
     return phone.replace(/\D/g, ''); 
+}
+
+// 🛠️ فکس 2: Pairing Code کے لیے نمبر کو بالکل صحیح کنٹری کوڈ کے ساتھ سیٹ کرنے والا فنکشن
+function formatPhoneNumberForPairing(phoneNumber) {
+    let num = phoneNumber.toString().replace(/\D/g, ''); // صرف ہندسے نکالیں
+    
+    // اگر 03 سے شروع ہو رہا ہے (مثال: 0301...)
+    if (num.startsWith('03')) {
+        return '92' + num.substring(1);
+    } 
+    // اگر صرف 3 سے شروع ہو رہا ہے اور 10 ہندسوں کا ہے (مثال: 301...)
+    else if (num.startsWith('3') && num.length === 10) {
+        return '92' + num;
+    }
+    // اگر پہلے سے ہی 92 یا کوئی اور کنٹری کوڈ موجود ہے
+    return num;
 }
 
 // ==========================================
@@ -163,7 +176,6 @@ async function startBroadcastWorker(sock, deviceId) {
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate('composing', jid);
             
-            // ٹائپنگ کا ٹائم اصلی انسان کی طرح 5 سے 8 سیکنڈ رکھا گیا ہے
             const typingTime = Math.floor(Math.random() * (8000 - 5000 + 1)) + 5000;
             await new Promise(resolve => setTimeout(resolve, typingTime));
             
@@ -176,7 +188,6 @@ async function startBroadcastWorker(sock, deviceId) {
             });
             console.log(`[${deviceId}] ✅ Sent successfully to: ${phone}`);
             
-            // 🚨 15 to 20 Minutes Anti-Ban Delay (سٹکٹر اینٹی بین ڈیلے)
             const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
             console.log(`[${deviceId}] ⏳ Anti-Ban Delay: Waiting for ${delayMinutesDisplay} minutes before next message...`);
@@ -212,10 +223,10 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        // 🛡️ واٹس ایپ میں "Botzmine Web" شو ہوگا تاکہ اصلی براؤزر لاگ ان لگے
-        browser: ['Botzmine Web', 'Chrome', '122.0.0.0'], 
+        // 🛡️ فکس 1: Pairing Code کے لیے براؤزر کو سٹینڈرڈ رکھنا لازمی ہے۔ 'Botzmine Web' سے ایرر آتا ہے۔
+        browser: Browsers.ubuntu('Chrome'), 
         syncFullHistory: false,
-        qrTimeout: 50000 // ⏳ QR Code Expiry set to 50 Seconds
+        qrTimeout: 50000 
     });
 
     let pairingCodeRequested = false;
@@ -239,34 +250,16 @@ async function startDevice(phoneNumberId) {
             });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
 
-            // 🔑 2. GENERATE 8-DIGIT PAIRING CODE (SMART INTERNATIONAL FORMATTING)
+            // 🔑 2. GENERATE 8-DIGIT PAIRING CODE
             if (!pairingCodeRequested && !sock.authState.creds.registered) {
                 pairingCodeRequested = true;
                 
                 setTimeout(async () => {
                     try {
-                        let rawInput = phoneNumberId.toString().trim();
-                        // صرف نمبرز اور + کا نشان رہنے دیں باقی سب صاف کر دیں
-                        let formattedNumber = rawInput.replace(/[^0-9+]/g, '');
-                        
-                        if (formattedNumber.startsWith('+')) {
-                            // +92300... -> 92300...
-                            formattedNumber = formattedNumber.replace('+', '');
-                        } else if (formattedNumber.startsWith('00')) {
-                            // 0092300... -> 92300...
-                            formattedNumber = formattedNumber.substring(2);
-                        } else if (formattedNumber.startsWith('03') && formattedNumber.length === 11) {
-                            // پاکستان کا لوکل نمبر (03001234567) -> 923001234567
-                            formattedNumber = '92' + formattedNumber.substring(1);
-                        } else if (formattedNumber.startsWith('0')) {
-                            // کسی دوسرے ملک کا لوکل نمبر ہو یا غلطی سے 0 لگایا ہو
-                            formattedNumber = formattedNumber.substring(1);
-                        }
-                        
-                        // آخری بار صرف نمبرز کو محفوظ کریں تاکہ کوئی فالتو نشان نہ جائے
-                        formattedNumber = formattedNumber.replace(/\D/g, '');
+                        // 🛠️ فکس 2 کو اپلائی کیا گیا
+                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
 
-                        console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for formatted exact number: ${formattedNumber}...`);
+                        console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for exact number: ${formattedNumber}...`);
                         
                         const pairingCode = await sock.requestPairingCode(formattedNumber);
                         
@@ -285,7 +278,7 @@ async function startDevice(phoneNumberId) {
             }
         }
         
-        // ✅ ON SUCCESSFUL CONNECTION (کنیکٹ ہونے پر یوزر کے نمبر کا سٹیٹس اپڈیٹ ہوگا)
+        // ✅ ON SUCCESSFUL CONNECTION
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
             console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
@@ -293,18 +286,17 @@ async function startDevice(phoneNumberId) {
             await fbDelete(`bot_requests/${phoneNumberId}`);
             await fbDelete(`qrcodes/${phoneNumberId}`);
 
-            // ڈیٹا بیس میں اسی نمبر کو Active/Connected شو کرے گا
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
-                phone: botNumber, // اصلی واٹس ایپ نمبر جس سے لاگ ان ہوا ہے
-                device_id: phoneNumberId, // فرنٹ اینڈ سے آیا ہوا نمبر
+                phone: botNumber, 
+                device_id: phoneNumberId, 
                 connected_at: new Date().toISOString()
             });
             
             startBroadcastWorker(sock, phoneNumberId);
         }
         
-        // ❌ ON DISCONNECT / LOGOUT (ڈسکنیکٹ ہونے پر سٹیٹس اپڈیٹ)
+        // ❌ ON DISCONNECT / LOGOUT
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
@@ -320,7 +312,6 @@ async function startDevice(phoneNumberId) {
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
                 
-                // یوزر کا اکاؤنٹ لاگ آؤٹ ہونے پر سٹیٹس 'disconnected' ہو جائے گا
                 await fbPatch(`devices/${phoneNumberId}`, { 
                     status: 'disconnected', 
                     phone: null 
@@ -345,6 +336,13 @@ async function pollFirebaseForDevices() {
             for (const phoneId in requests) {
                 const reqData = requests[phoneId];
                 if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
+                    
+                    // 🛠️ فکس 3: جب بھی نئی ریکویسٹ آئے، پرانا کرپٹ سیشن فولڈر لازمی ڈیلیٹ کریں
+                    const sessionDir = `sessions_${phoneId}`;
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                    }
+
                     await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
                     startDevice(phoneId);
                 }
@@ -375,4 +373,4 @@ if (!FIREBASE_URL) {
     process.exit(1); 
 }
 
-pollFirebaseForDevices();                        
+pollFirebaseForDevices();
