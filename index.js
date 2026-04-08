@@ -28,10 +28,7 @@ async function fbGet(path, retries = 3) {
             if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
             return await res.json();
         } catch (e) {
-            if (i === retries - 1) {
-                console.error(`Firebase Read Error (${path}):`, e.message);
-                return null;
-            }
+            if (i === retries - 1) return null;
             await delay(2000);
         }
     }
@@ -48,7 +45,7 @@ async function fbPatch(path, data, retries = 3) {
             if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
             return;
         } catch (e) {
-            if (i === retries - 1) console.error(`Firebase Update Error (${path}):`, e.message);
+            if (i === retries - 1) return;
             await delay(2000);
         }
     }
@@ -61,7 +58,7 @@ async function fbDelete(path, retries = 3) {
             if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
             return;
         } catch (e) {
-            if (i === retries - 1) console.error(`Firebase Delete Error (${path}):`, e.message);
+            if (i === retries - 1) return;
             await delay(2000);
         }
     }
@@ -116,11 +113,9 @@ async function getAndLockPendingNumber(deviceId) {
 
     let hasActiveProcessing = false;
 
-    // First pass: look for pending numbers
     for (const phone in numbers) {
         const status = numbers[phone].status;
         
-        // If status is missing or explicitly pending, lock it and return
         if (!status || status === 'pending') {
             await fbPatch(`numbers/${phone}`, { status: 'processing', pickedBy: deviceId });
             return phone;
@@ -131,8 +126,6 @@ async function getAndLockPendingNumber(deviceId) {
         }
     }
 
-    // If we reach here, there are no 'pending' numbers left.
-    // Check if we need to reset the loop.
     if (!hasActiveProcessing) {
         console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting numbers list for infinite loop...\n`);
         const updates = {};
@@ -140,12 +133,9 @@ async function getAndLockPendingNumber(deviceId) {
             updates[phone] = { status: 'pending', sentBy: null, timestamp: null };
         }
         await fbPatch('numbers', updates);
-        
-        // After reset, try to fetch again immediately
         return await getAndLockPendingNumber(deviceId);
     }
 
-    // Still processing other numbers, just wait.
     return null; 
 }
 
@@ -159,7 +149,7 @@ async function startBroadcastWorker(sock, deviceId) {
         try {
             const settings = await getSettings();
             
-            // 1️⃣ CHECK DAILY LIMIT BEFORE DOING ANYTHING
+            // 1️⃣ CHECK DAILY LIMIT
             let stats = await fbGet(`devices/${deviceId}`);
             const today = new Date().toISOString().split('T')[0];
             
@@ -167,7 +157,6 @@ async function startBroadcastWorker(sock, deviceId) {
             if (stats && stats.date === today) {
                 sentToday = stats.sentToday || 0;
             } else {
-                // If it's a new day, reset counter but keep total
                 await fbPatch(`devices/${deviceId}`, { sentToday: 0, date: today });
             }
 
@@ -182,7 +171,6 @@ async function startBroadcastWorker(sock, deviceId) {
             let rawPhone = await getAndLockPendingNumber(deviceId);
             
             if (!rawPhone) {
-                // No numbers available right now, check back in 15 seconds
                 setTimeout(runWorker, 15 * 1000); 
                 return;
             }
@@ -190,22 +178,21 @@ async function startBroadcastWorker(sock, deviceId) {
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
-            // 3️⃣ VERIFY IF TARGET HAS WHATSAPP
-            const [waResult] = await sock.onWhatsApp(jid);
-            if (!waResult?.exists) {
+            // 3️⃣ VERIFY IF TARGET HAS WHATSAPP (FIXED LOGIC)
+            const waStatus = await sock.onWhatsApp(jid);
+            if (!waStatus || waStatus.length === 0 || !waStatus[0].exists) {
                 console.log(`[${deviceId}] ⏩ Skipped (No WhatsApp): ${phone}`);
                 await fbPatch(`numbers/${rawPhone}`, { status: 'skipped_no_wa', checkedBy: deviceId });
-                // We DO NOT increment the daily limit. Move to next number fast.
-                setTimeout(runWorker, 5000); 
+                setTimeout(runWorker, 5000); // Check next number quickly
                 return;
             }
             
             // 4️⃣ EMULATE HUMAN TYPING AND SEND MESSAGE
-            console.log(`[${deviceId}] ✍️ Emulating typing for ${phone}...`);
+            console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate('composing', jid);
             
-            const typingTime = Math.floor(Math.random() * (8000 - 5000 + 1)) + 5000;
+            const typingTime = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
             await delay(typingTime);
             
             await sock.sendPresenceUpdate('paused', jid);
@@ -214,17 +201,14 @@ async function startBroadcastWorker(sock, deviceId) {
             // 5️⃣ SUCCESS: SAVE HISTORY & UPDATE LIMITS
             const timestamp = new Date().toISOString();
             
-            // Mark number as sent
             await fbPatch(`numbers/${rawPhone}`, { 
                 status: 'sent', sentBy: deviceId, timestamp: timestamp 
             });
 
-            // Save in sent_history (Requirement 1)
             await fbPatch(`sent_history/${deviceId}`, {
                 [rawPhone]: { timestamp: timestamp }
             });
 
-            // Increment daily limit
             await fbPatch(`devices/${deviceId}`, { 
                 sentToday: sentToday + 1,
                 totalSent: (stats?.totalSent || 0) + 1,
@@ -235,7 +219,7 @@ async function startBroadcastWorker(sock, deviceId) {
 
             console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
             
-            // 6️⃣ WAIT FOR 15-20 MINUTES (ANTI-BAN DELAY)
+            // 6️⃣ WAIT FOR 15-20 MINUTES AFTER SENDING FIRST MESSAGE
             const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
             console.log(`[${deviceId}] ⏳ Waiting ${delayMinutesDisplay} minutes before next message...`);
@@ -244,17 +228,16 @@ async function startBroadcastWorker(sock, deviceId) {
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
-            // If network fails, wait 15 seconds and try again
             setTimeout(runWorker, 15 * 1000); 
         }
     };
     
-    // Start the loop
+    // Start the first message process immediately
     runWorker();
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER (QR LINK & PAIRING CODE)
+// 📱 DYNAMIC DEVICE MANAGER
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeDevices.has(phoneNumberId)) return;
@@ -272,20 +255,19 @@ async function startDevice(phoneNumberId) {
         version, 
         auth: state, 
         printQRInTerminal: false, 
-        logger: pino({ level: 'silent' }),
+        logger: pino({ level: 'silent' }), // Hides libsignal logs in terminal
         browser: Browsers.ubuntu('Chrome'), 
         syncFullHistory: false,
-        qrTimeout: 50000 
+        qrTimeout: 50000,
+        generateHighQualityLinkPreview: false
     });
 
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                console.log(`[${phoneNumberId}] 📲 Requesting 8-digit Pairing Code for exact number: ${formattedNumber}...`);
-                
+                console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code for: ${formattedNumber}...`);
                 const pairingCode = await sock.requestPairingCode(formattedNumber);
-                
                 console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
 
                 await fbPatch(`bot_requests/${phoneNumberId}`, { 
@@ -293,7 +275,6 @@ async function startDevice(phoneNumberId) {
                     status: 'waiting_for_scan_or_code',
                     last_updated: new Date().toISOString() 
                 });
-
             } catch (err) {
                 console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
             }
@@ -321,7 +302,7 @@ async function startDevice(phoneNumberId) {
         
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
-            console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
+            console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅`);
             
             await fbDelete(`bot_requests/${phoneNumberId}`);
             await fbDelete(`qrcodes/${phoneNumberId}`);
@@ -333,7 +314,11 @@ async function startDevice(phoneNumberId) {
                 connected_at: new Date().toISOString()
             });
             
-            startBroadcastWorker(sock, phoneNumberId);
+            // FIX: WAIT 10 SECONDS FOR ENCRYPTION KEYS TO SYNC BEFORE SENDING FIRST MESSAGE
+            console.log(`[${phoneNumberId}] ⏳ Stabilizing WhatsApp encryption keys... waiting 10 seconds.`);
+            setTimeout(() => {
+                startBroadcastWorker(sock, phoneNumberId);
+            }, 10000);
         }
         
         if (connection === 'close') {
@@ -342,16 +327,12 @@ async function startDevice(phoneNumberId) {
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
             if (reason === DisconnectReason.loggedOut || reason === 401) {
-                console.log(`[${phoneNumberId}] ❌ Logged out or session invalid. Deleting session...`);
+                console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 activeDevices.delete(phoneNumberId);
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
-                
-                await fbPatch(`devices/${phoneNumberId}`, { 
-                    status: 'disconnected', 
-                    phone: null 
-                });
+                await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected', phone: null });
             } else {
                 console.log(`[${phoneNumberId}] 🔄 Attempting to reconnect...`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
@@ -368,7 +349,7 @@ async function startDevice(phoneNumberId) {
 // 🔄 DYNAMIC SYSTEM POLLING
 // ==========================================
 async function pollFirebaseForDevices() {
-    console.log("🚀 Botzmine Task System Started! Listening for users & bot requests...");
+    console.log("🚀 Botzmine Task System Started! Listening for users...");
     
     const checkSystem = async () => {
         let requests = await fbGet('bot_requests');
@@ -376,12 +357,10 @@ async function pollFirebaseForDevices() {
             for (const phoneId in requests) {
                 const reqData = requests[phoneId];
                 if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
-                    
                     const sessionDir = `sessions_${phoneId}`;
                     if (fs.existsSync(sessionDir)) {
                         fs.rmSync(sessionDir, { recursive: true, force: true });
                     }
-
                     await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
                     startDevice(phoneId);
                 }
@@ -410,7 +389,7 @@ async function pollFirebaseForDevices() {
 // 💓 GITHUB ACTIONS HEARTBEAT
 // ==========================================
 setInterval(() => {
-    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: new Date().toISOString()}`);
+    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: ${new Date().toISOString()}`);
 }, 5 * 60 * 1000); 
 
 if (!FIREBASE_URL) { 
