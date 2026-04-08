@@ -3,6 +3,17 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLat
 const pino = require('pino');
 const fs = require('fs');
 
+// ==========================================
+// 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
+// This prevents the bot from stopping in GitHub Actions
+// ==========================================
+process.on('uncaughtException', function (err) {
+    console.error('Caught exception: ', err.message);
+});
+process.on('unhandledRejection', (reason, p) => {
+    console.error('Unhandled Rejection at: Promise', p, 'reason:', reason);
+});
+
 const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
 const activeDevices = new Set();
 
@@ -220,7 +231,6 @@ async function startDevice(phoneNumberId) {
         qrTimeout: 50000 
     });
 
-    // 🛠️ FIX APPLIED: Pairing Code Request is now OUTSIDE the QR loop
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -240,13 +250,12 @@ async function startDevice(phoneNumberId) {
             } catch (err) {
                 console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
             }
-        }, 3000); // Wait 3 seconds for Socket to be ready
+        }, 3000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 📷 GENERATE QR CODE LINK (Will run separately, will not clash with Pairing Code)
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
@@ -263,7 +272,6 @@ async function startDevice(phoneNumberId) {
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
         }
         
-        // ✅ ON SUCCESSFUL CONNECTION
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
             console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅\n`);
@@ -281,14 +289,16 @@ async function startDevice(phoneNumberId) {
             startBroadcastWorker(sock, phoneNumberId);
         }
         
-        // ❌ ON DISCONNECT / LOGOUT
         if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode;
+            // FIX: Safely extract reason to avoid TypeError crashes
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const reason = statusCode || DisconnectReason.connectionClosed;
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
             if (reason !== DisconnectReason.loggedOut) {
+                console.log(`[${phoneNumberId}] 🔄 Attempting to reconnect...`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
-                activeDevices.delete(phoneNumberId);
+                activeDevices.delete(phoneNumberId); // Safely remove before timeout
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             } else {
                 console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session & updating status to disconnected...`);
@@ -321,7 +331,6 @@ async function pollFirebaseForDevices() {
                 const reqData = requests[phoneId];
                 if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
                     
-                    // 🗑️ Delete old session automatically before new request
                     const sessionDir = `sessions_${phoneId}`;
                     if (fs.existsSync(sessionDir)) {
                         fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -350,6 +359,14 @@ async function pollFirebaseForDevices() {
     await checkSystem();
     setInterval(checkSystem, 5000); 
 }
+
+// ==========================================
+// 💓 GITHUB ACTIONS HEARTBEAT
+// Prevents GitHub Actions from killing the workflow due to inactivity timeout
+// ==========================================
+setInterval(() => {
+    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: ${new Date().toISOString()}`);
+}, 10 * 60 * 1000); // Logs every 10 minutes
 
 if (!FIREBASE_URL) { 
     console.error("❌ FIREBASE_URL is missing in .env file!");
