@@ -105,35 +105,42 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC
+// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC (UPDATED)
 // ==========================================
-async function getAndLockPendingNumber(deviceId) {
+async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
     if (!numbers) return null;
 
-    let hasActiveProcessing = false;
+    let foundPhone = null;
+    let hasAnyNumber = false;
 
     for (const phone in numbers) {
+        hasAnyNumber = true;
         const status = numbers[phone].status;
         
-        if (!status || status === 'pending') {
-            await fbPatch(`numbers/${phone}`, { status: 'processing', pickedBy: deviceId });
-            return phone;
-        }
-
-        if (status === 'processing') {
-            hasActiveProcessing = true;
+        // FIX: Treat 'pending', empty status, AND old stuck 'processing' as available for sending
+        if (!status || status === 'pending' || status === 'processing') {
+            foundPhone = phone;
+            break; 
         }
     }
 
-    if (!hasActiveProcessing) {
-        console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting numbers list for infinite loop...\n`);
+    if (foundPhone) {
+        // We DO NOT lock it with 'processing' anymore. We just return it directly.
+        return foundPhone;
+    }
+
+    // If we reach here, it means all numbers are either 'sent', 'failed', or 'skipped_no_wa'
+    if (hasAnyNumber) {
+        console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting all numbers back to pending...\n`);
         const updates = {};
         for (const phone in numbers) {
-            updates[phone] = { status: 'pending', sentBy: null, timestamp: null };
+            updates[phone] = { status: 'pending', sentBy: null, timestamp: null, pickedBy: null };
         }
         await fbPatch('numbers', updates);
-        return await getAndLockPendingNumber(deviceId);
+        
+        // Fetch again after resetting
+        return await getNextPendingNumber();
     }
 
     return null; 
@@ -143,7 +150,7 @@ async function getAndLockPendingNumber(deviceId) {
 // 🚀 ANTI-BAN BROADCAST WORKER
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
-    console.log(`[${deviceId}] 🟢 Broadcast Worker activated!`);
+    console.log(`[${deviceId}] 🟢 Broadcast Worker activated! Checking for numbers...`);
     
     const runWorker = async () => {
         try {
@@ -167,10 +174,11 @@ async function startBroadcastWorker(sock, deviceId) {
                 return;
             }
             
-            // 2️⃣ GET TARGET NUMBER
-            let rawPhone = await getAndLockPendingNumber(deviceId);
+            // 2️⃣ GET NEXT TARGET NUMBER (WITHOUT LOCKING IT)
+            let rawPhone = await getNextPendingNumber();
             
             if (!rawPhone) {
+                // If database is completely empty
                 setTimeout(runWorker, 15 * 1000); 
                 return;
             }
@@ -178,11 +186,12 @@ async function startBroadcastWorker(sock, deviceId) {
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
-            // 3️⃣ VERIFY IF TARGET HAS WHATSAPP (FIXED LOGIC)
+            // 3️⃣ VERIFY IF TARGET HAS WHATSAPP
             const waStatus = await sock.onWhatsApp(jid);
             if (!waStatus || waStatus.length === 0 || !waStatus[0].exists) {
                 console.log(`[${deviceId}] ⏩ Skipped (No WhatsApp): ${phone}`);
-                await fbPatch(`numbers/${rawPhone}`, { status: 'skipped_no_wa', checkedBy: deviceId });
+                // Mark as skipped so it's not picked again in this loop
+                await fbPatch(`numbers/${rawPhone}`, { status: 'skipped_no_wa', pickedBy: null });
                 setTimeout(runWorker, 5000); // Check next number quickly
                 return;
             }
@@ -198,17 +207,23 @@ async function startBroadcastWorker(sock, deviceId) {
             await sock.sendPresenceUpdate('paused', jid);
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
-            // 5️⃣ SUCCESS: SAVE HISTORY & UPDATE LIMITS
+            // 5️⃣ SUCCESS: SAVE HISTORY, MARK SENT & UPDATE LIMITS
             const timestamp = new Date().toISOString();
             
+            // Mark number as sent in Database
             await fbPatch(`numbers/${rawPhone}`, { 
-                status: 'sent', sentBy: deviceId, timestamp: timestamp 
+                status: 'sent', 
+                sentBy: deviceId, 
+                timestamp: timestamp,
+                pickedBy: null // Ensure no device lock remains
             });
 
+            // Keep Sent History record
             await fbPatch(`sent_history/${deviceId}`, {
                 [rawPhone]: { timestamp: timestamp }
             });
 
+            // Update Device daily count
             await fbPatch(`devices/${deviceId}`, { 
                 sentToday: sentToday + 1,
                 totalSent: (stats?.totalSent || 0) + 1,
@@ -219,7 +234,7 @@ async function startBroadcastWorker(sock, deviceId) {
 
             console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
             
-            // 6️⃣ WAIT FOR 15-20 MINUTES AFTER SENDING FIRST MESSAGE
+            // 6️⃣ WAIT FOR 15-20 MINUTES BEFORE NEXT MESSAGE
             const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
             console.log(`[${deviceId}] ⏳ Waiting ${delayMinutesDisplay} minutes before next message...`);
@@ -255,7 +270,7 @@ async function startDevice(phoneNumberId) {
         version, 
         auth: state, 
         printQRInTerminal: false, 
-        logger: pino({ level: 'silent' }), // Hides libsignal logs in terminal
+        logger: pino({ level: 'silent' }),
         browser: Browsers.ubuntu('Chrome'), 
         syncFullHistory: false,
         qrTimeout: 50000,
@@ -314,7 +329,7 @@ async function startDevice(phoneNumberId) {
                 connected_at: new Date().toISOString()
             });
             
-            // FIX: WAIT 10 SECONDS FOR ENCRYPTION KEYS TO SYNC BEFORE SENDING FIRST MESSAGE
+            // WAIT 10 SECONDS FOR ENCRYPTION KEYS TO SYNC
             console.log(`[${phoneNumberId}] ⏳ Stabilizing WhatsApp encryption keys... waiting 10 seconds.`);
             setTimeout(() => {
                 startBroadcastWorker(sock, phoneNumberId);
