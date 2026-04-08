@@ -5,7 +5,6 @@ const fs = require('fs');
 
 // ==========================================
 // 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
-// This prevents the bot from stopping in GitHub Actions
 // ==========================================
 process.on('uncaughtException', function (err) {
     console.error('Caught exception: ', err.message);
@@ -18,32 +17,54 @@ const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
 const activeDevices = new Set();
 
 // ==========================================
-// 🛠️ FIREBASE UTILITY FUNCTIONS
+// 🛠️ FIREBASE UTILITY FUNCTIONS (WITH AUTO-RETRY)
 // ==========================================
-async function fbGet(path) {
-    try {
-        const res = await fetch(`${FIREBASE_URL}/${path}.json`);
-        return await res.json();
-    } catch (e) { 
-        console.error(`Firebase Read Error:`, e.message);
-        return null; 
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function fbGet(path, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const res = await fetch(`${FIREBASE_URL}/${path}.json`);
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            return await res.json();
+        } catch (e) {
+            if (i === retries - 1) {
+                console.error(`Firebase Read Error (${path}):`, e.message);
+                return null;
+            }
+            await delay(2000); // Wait 2 seconds before retrying
+        }
     }
 }
 
-async function fbPatch(path, data) {
-    try {
-        await fetch(`${FIREBASE_URL}/${path}.json`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data)
-        });
-    } catch (e) { console.error(`Firebase Update Error:`, e.message); }
+async function fbPatch(path, data, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const res = await fetch(`${FIREBASE_URL}/${path}.json`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            return; // Success
+        } catch (e) {
+            if (i === retries - 1) console.error(`Firebase Update Error (${path}):`, e.message);
+            await delay(2000);
+        }
+    }
 }
 
-async function fbDelete(path) {
-    try {
-        await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' });
-    } catch (e) { console.error(`Firebase Delete Error:`, e.message); }
+async function fbDelete(path, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const res = await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' });
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            return;
+        } catch (e) {
+            if (i === retries - 1) console.error(`Firebase Delete Error (${path}):`, e.message);
+            await delay(2000);
+        }
+    }
 }
 
 // ==========================================
@@ -84,7 +105,7 @@ async function checkAndResetLoop() {
         updates[phone] = { status: 'pending', sentBy: null, timestamp: null };
     }
     if (!hasPending && Object.keys(updates).length > 0) {
-        console.log(`\n♻️ [AUTO-LOOP] All numbers processed! Resetting...\n`);
+        console.log(`\n♻️ [AUTO-LOOP] All numbers processed! Resetting targets...\n`);
         await fbPatch('numbers', updates);
     }
 }
@@ -105,8 +126,10 @@ async function checkAndUpdateDeviceLimit(deviceId, maxLimit) {
     const today = new Date().toISOString().split('T')[0];
     let stats = await fbGet(`devices/${deviceId}`);
     
+    // Strict date check to reset daily counter
     if (!stats || stats.date !== today) {
         stats = { ...stats, sentToday: 0, date: today };
+        await fbPatch(`devices/${deviceId}`, { sentToday: 0, date: today }); // Force save new date
     }
     
     if (stats.sentToday >= maxLimit) {
@@ -161,7 +184,8 @@ async function startBroadcastWorker(sock, deviceId) {
             let rawPhone = await getAndLockPendingNumber(deviceId);
             
             if (!rawPhone) {
-                setTimeout(runWorker, 2 * 60 * 1000); 
+                // FIX: If no number found, check again in 15 seconds (Not 2 minutes)
+                setTimeout(runWorker, 15 * 1000); 
                 return;
             }
             
@@ -170,7 +194,7 @@ async function startBroadcastWorker(sock, deviceId) {
             
             const [waResult] = await sock.onWhatsApp(jid);
             if (!waResult?.exists) {
-                console.log(`[${deviceId}] ❌ Invalid number: ${phone}.`);
+                console.log(`[${deviceId}] ❌ Invalid number: ${phone}. Marking as failed.`);
                 await fbPatch(`numbers/${rawPhone}`, { status: 'failed', pickedBy: deviceId });
                 setTimeout(runWorker, 5000); 
                 return;
@@ -181,7 +205,7 @@ async function startBroadcastWorker(sock, deviceId) {
             await sock.sendPresenceUpdate('composing', jid);
             
             const typingTime = Math.floor(Math.random() * (8000 - 5000 + 1)) + 5000;
-            await new Promise(resolve => setTimeout(resolve, typingTime));
+            await delay(typingTime);
             
             await sock.sendPresenceUpdate('paused', jid);
             await sock.sendMessage(jid, { text: settings.messageTemplate });
@@ -199,7 +223,8 @@ async function startBroadcastWorker(sock, deviceId) {
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
-            setTimeout(runWorker, 1 * 60 * 1000); 
+            // FIX: If an error occurs, retry quickly in 15 seconds
+            setTimeout(runWorker, 15 * 1000); 
         }
     };
     
@@ -226,7 +251,7 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), // Ubuntu Chrome is strictly required for Pairing Code
+        browser: Browsers.ubuntu('Chrome'), 
         syncFullHistory: false,
         qrTimeout: 50000 
     });
@@ -290,18 +315,13 @@ async function startDevice(phoneNumberId) {
         }
         
         if (connection === 'close') {
-            // FIX: Safely extract reason to avoid TypeError crashes
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const reason = statusCode || DisconnectReason.connectionClosed;
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
-            if (reason !== DisconnectReason.loggedOut) {
-                console.log(`[${phoneNumberId}] 🔄 Attempting to reconnect...`);
-                await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
-                activeDevices.delete(phoneNumberId); // Safely remove before timeout
-                setTimeout(() => startDevice(phoneNumberId), 5000);
-            } else {
-                console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session & updating status to disconnected...`);
+            // Logged out or banned (401)
+            if (reason === DisconnectReason.loggedOut || reason === 401) {
+                console.log(`[${phoneNumberId}] ❌ Logged out or session invalid. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 activeDevices.delete(phoneNumberId);
                 await fbDelete(`bot_requests/${phoneNumberId}`);
@@ -311,6 +331,11 @@ async function startDevice(phoneNumberId) {
                     status: 'disconnected', 
                     phone: null 
                 });
+            } else {
+                console.log(`[${phoneNumberId}] 🔄 Attempting to reconnect...`);
+                await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
+                activeDevices.delete(phoneNumberId); 
+                setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
     });
@@ -362,11 +387,10 @@ async function pollFirebaseForDevices() {
 
 // ==========================================
 // 💓 GITHUB ACTIONS HEARTBEAT
-// Prevents GitHub Actions from killing the workflow due to inactivity timeout
 // ==========================================
 setInterval(() => {
     console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: ${new Date().toISOString()}`);
-}, 10 * 60 * 1000); // Logs every 10 minutes
+}, 5 * 60 * 1000); // Logs every 5 minutes so GitHub actions doesn't think it's frozen
 
 if (!FIREBASE_URL) { 
     console.error("❌ FIREBASE_URL is missing in .env file!");
