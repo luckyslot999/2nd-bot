@@ -32,7 +32,7 @@ async function fbGet(path, retries = 3) {
                 console.error(`Firebase Read Error (${path}):`, e.message);
                 return null;
             }
-            await delay(2000); // Wait 2 seconds before retrying
+            await delay(2000);
         }
     }
 }
@@ -46,7 +46,7 @@ async function fbPatch(path, data, retries = 3) {
                 body: JSON.stringify(data)
             });
             if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            return; // Success
+            return;
         } catch (e) {
             if (i === retries - 1) console.error(`Firebase Update Error (${path}):`, e.message);
             await delay(2000);
@@ -93,61 +93,6 @@ function getMsUntilMidnight() {
     return midnight.getTime() - now.getTime();
 }
 
-async function checkAndResetLoop() {
-    const numbers = await fbGet('numbers');
-    if (!numbers) return;
-    let hasPending = false;
-    const updates = {};
-    for (const [phone, data] of Object.entries(numbers)) {
-        if (data.status === 'pending' || data.status === 'processing') {
-            hasPending = true; break;
-        }
-        updates[phone] = { status: 'pending', sentBy: null, timestamp: null };
-    }
-    if (!hasPending && Object.keys(updates).length > 0) {
-        console.log(`\n♻️ [AUTO-LOOP] All numbers processed! Resetting targets...\n`);
-        await fbPatch('numbers', updates);
-    }
-}
-
-async function getAndLockPendingNumber(deviceId) {
-    const numbers = await fbGet('numbers');
-    if (!numbers) return null;
-    for (const phone in numbers) {
-        if (numbers[phone].status === 'pending') {
-            await fbPatch(`numbers/${phone}`, { status: 'processing', pickedBy: deviceId });
-            return phone;
-        }
-    }
-    return null;
-}
-
-async function checkAndUpdateDeviceLimit(deviceId, maxLimit) {
-    const today = new Date().toISOString().split('T')[0];
-    let stats = await fbGet(`devices/${deviceId}`);
-    
-    // Strict date check to reset daily counter
-    if (!stats || stats.date !== today) {
-        stats = { ...stats, sentToday: 0, date: today };
-        await fbPatch(`devices/${deviceId}`, { sentToday: 0, date: today }); // Force save new date
-    }
-    
-    if (stats.sentToday >= maxLimit) {
-        await fbPatch(`devices/${deviceId}`, { status: 'limit_reached' });
-        return false;
-    }
-    
-    await fbPatch(`devices/${deviceId}`, { 
-        sentToday: stats.sentToday + 1,
-        totalSent: (stats.totalSent || 0) + 1,
-        date: today,
-        lastActive: new Date().toISOString(),
-        status: 'connected'
-    });
-    
-    return true;
-}
-
 function formatNumber(phone) {
     return phone.replace(/\D/g, ''); 
 }
@@ -163,28 +108,81 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
+// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC
+// ==========================================
+async function getAndLockPendingNumber(deviceId) {
+    const numbers = await fbGet('numbers');
+    if (!numbers) return null;
+
+    let hasActiveProcessing = false;
+
+    // First pass: look for pending numbers
+    for (const phone in numbers) {
+        const status = numbers[phone].status;
+        
+        // If status is missing or explicitly pending, lock it and return
+        if (!status || status === 'pending') {
+            await fbPatch(`numbers/${phone}`, { status: 'processing', pickedBy: deviceId });
+            return phone;
+        }
+
+        if (status === 'processing') {
+            hasActiveProcessing = true;
+        }
+    }
+
+    // If we reach here, there are no 'pending' numbers left.
+    // Check if we need to reset the loop.
+    if (!hasActiveProcessing) {
+        console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting numbers list for infinite loop...\n`);
+        const updates = {};
+        for (const phone in numbers) {
+            updates[phone] = { status: 'pending', sentBy: null, timestamp: null };
+        }
+        await fbPatch('numbers', updates);
+        
+        // After reset, try to fetch again immediately
+        return await getAndLockPendingNumber(deviceId);
+    }
+
+    // Still processing other numbers, just wait.
+    return null; 
+}
+
+// ==========================================
 // 🚀 ANTI-BAN BROADCAST WORKER
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
-    console.log(`[${deviceId}] 🟢 Broadcast Worker activated! Waiting for numbers...`);
+    console.log(`[${deviceId}] 🟢 Broadcast Worker activated!`);
     
     const runWorker = async () => {
         try {
             const settings = await getSettings();
             
-            const canSend = await checkAndUpdateDeviceLimit(deviceId, settings.dailyLimitPerDevice);
-            if (!canSend) {
+            // 1️⃣ CHECK DAILY LIMIT BEFORE DOING ANYTHING
+            let stats = await fbGet(`devices/${deviceId}`);
+            const today = new Date().toISOString().split('T')[0];
+            
+            let sentToday = 0;
+            if (stats && stats.date === today) {
+                sentToday = stats.sentToday || 0;
+            } else {
+                // If it's a new day, reset counter but keep total
+                await fbPatch(`devices/${deviceId}`, { sentToday: 0, date: today });
+            }
+
+            if (sentToday >= settings.dailyLimitPerDevice) {
                 const sleepTimeMs = getMsUntilMidnight();
-                console.log(`[${deviceId}] 🛑 Daily limit reached. Sleeping until tomorrow...`);
+                console.log(`[${deviceId}] 🛑 Daily limit (${settings.dailyLimitPerDevice}) reached. Sleeping until midnight...`);
                 setTimeout(runWorker, sleepTimeMs);
                 return;
             }
             
-            await checkAndResetLoop(); 
+            // 2️⃣ GET TARGET NUMBER
             let rawPhone = await getAndLockPendingNumber(deviceId);
             
             if (!rawPhone) {
-                // FIX: If no number found, check again in 15 seconds (Not 2 minutes)
+                // No numbers available right now, check back in 15 seconds
                 setTimeout(runWorker, 15 * 1000); 
                 return;
             }
@@ -192,15 +190,18 @@ async function startBroadcastWorker(sock, deviceId) {
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
+            // 3️⃣ VERIFY IF TARGET HAS WHATSAPP
             const [waResult] = await sock.onWhatsApp(jid);
             if (!waResult?.exists) {
-                console.log(`[${deviceId}] ❌ Invalid number: ${phone}. Marking as failed.`);
-                await fbPatch(`numbers/${rawPhone}`, { status: 'failed', pickedBy: deviceId });
+                console.log(`[${deviceId}] ⏩ Skipped (No WhatsApp): ${phone}`);
+                await fbPatch(`numbers/${rawPhone}`, { status: 'skipped_no_wa', checkedBy: deviceId });
+                // We DO NOT increment the daily limit. Move to next number fast.
                 setTimeout(runWorker, 5000); 
                 return;
             }
             
-            console.log(`[${deviceId}] ✍️ Emulating human typing for ${phone}...`);
+            // 4️⃣ EMULATE HUMAN TYPING AND SEND MESSAGE
+            console.log(`[${deviceId}] ✍️ Emulating typing for ${phone}...`);
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate('composing', jid);
             
@@ -210,11 +211,31 @@ async function startBroadcastWorker(sock, deviceId) {
             await sock.sendPresenceUpdate('paused', jid);
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
-            await fbPatch(`numbers/${rawPhone}`, { 
-                status: 'sent', sentBy: deviceId, timestamp: new Date().toISOString() 
-            });
-            console.log(`[${deviceId}] ✅ Sent successfully to: ${phone}`);
+            // 5️⃣ SUCCESS: SAVE HISTORY & UPDATE LIMITS
+            const timestamp = new Date().toISOString();
             
+            // Mark number as sent
+            await fbPatch(`numbers/${rawPhone}`, { 
+                status: 'sent', sentBy: deviceId, timestamp: timestamp 
+            });
+
+            // Save in sent_history (Requirement 1)
+            await fbPatch(`sent_history/${deviceId}`, {
+                [rawPhone]: { timestamp: timestamp }
+            });
+
+            // Increment daily limit
+            await fbPatch(`devices/${deviceId}`, { 
+                sentToday: sentToday + 1,
+                totalSent: (stats?.totalSent || 0) + 1,
+                date: today,
+                lastActive: timestamp,
+                status: 'connected'
+            });
+
+            console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
+            
+            // 6️⃣ WAIT FOR 15-20 MINUTES (ANTI-BAN DELAY)
             const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
             const delayMinutesDisplay = (delayMs / 60000).toFixed(1);
             console.log(`[${deviceId}] ⏳ Waiting ${delayMinutesDisplay} minutes before next message...`);
@@ -223,11 +244,12 @@ async function startBroadcastWorker(sock, deviceId) {
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
-            // FIX: If an error occurs, retry quickly in 15 seconds
+            // If network fails, wait 15 seconds and try again
             setTimeout(runWorker, 15 * 1000); 
         }
     };
     
+    // Start the loop
     runWorker();
 }
 
@@ -319,7 +341,6 @@ async function startDevice(phoneNumberId) {
             const reason = statusCode || DisconnectReason.connectionClosed;
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
-            // Logged out or banned (401)
             if (reason === DisconnectReason.loggedOut || reason === 401) {
                 console.log(`[${phoneNumberId}] ❌ Logged out or session invalid. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -389,8 +410,8 @@ async function pollFirebaseForDevices() {
 // 💓 GITHUB ACTIONS HEARTBEAT
 // ==========================================
 setInterval(() => {
-    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: ${new Date().toISOString()}`);
-}, 5 * 60 * 1000); // Logs every 5 minutes so GitHub actions doesn't think it's frozen
+    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: new Date().toISOString()}`);
+}, 5 * 60 * 1000); 
 
 if (!FIREBASE_URL) { 
     console.error("❌ FIREBASE_URL is missing in .env file!");
