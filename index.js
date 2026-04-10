@@ -1,5 +1,3 @@
-
-
 require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -243,9 +241,55 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
+// 🕒 24-HOUR INACTIVITY CHECKER
+// ==========================================
+async function checkInactiveDevices() {
+    const devices = await fbGet('devices');
+    if (!devices) return;
+
+    const now = new Date().getTime();
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
+
+    for (const deviceId in devices) {
+        const device = devices[deviceId];
+        
+        // Agar device already disconnected nahi hai, aur uski lastActive ki detail majood hai
+        if (device.status !== 'disconnected' && device.lastActive) {
+            const lastActiveTime = new Date(device.lastActive).getTime();
+            
+            // Agar pichle 24 ghante se koi activity/message nahi hua
+            if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
+                console.log(`⚠️ [${deviceId}] No activity for 24 hours. Marking as disconnected...`);
+                
+                // 1. Firebase mein status update karein
+                await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
+                
+                // 2. Memory mein se active socket khatam karein
+                if (activeSockets.has(deviceId)) {
+                    try {
+                        const sock = activeSockets.get(deviceId);
+                        if (sock && typeof sock.ws?.close === 'function') {
+                            sock.ws.close();
+                        }
+                    } catch (e) {}
+                    activeSockets.delete(deviceId);
+                }
+
+                // 3. Local session files ko delete karein taake woh dobara scan maangay
+                const sessionDir = `sessions_${deviceId}`;
+                if (fs.existsSync(sessionDir)) {
+                    fs.rmSync(sessionDir, { recursive: true, force: true });
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
 // 🔄 SYSTEM POLLING
 // ==========================================
 async function pollFirebase() {
+    // 10 second delay for regular requests
     setInterval(async () => {
         const requests = await fbGet('bot_requests');
         if (requests) {
@@ -266,6 +310,11 @@ async function pollFirebase() {
             }
         }
     }, 10000);
+
+    // Har 5 minute baad 24-hours wala Inactivity Check run hoga
+    setInterval(() => {
+        checkInactiveDevices();
+    }, 5 * 60 * 1000); 
 }
 
 // ==========================================
