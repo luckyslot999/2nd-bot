@@ -15,7 +15,7 @@ process.on('unhandledRejection', (reason, p) => {
 });
 
 const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
-const activeDevices = new Set();
+const activeSockets = new Map(); // 🛠️ BUG FIX: Changed from Set to Map to track and kill zombie sockets
 
 // ==========================================
 // 🌐 NATIVE HTTP SERVER (FOR RENDER 24/7 UPTIME)
@@ -114,25 +114,23 @@ function formatNumber(phone) {
     return phone.replace(/\D/g, ''); 
 }
 
-// 🛠️ BUG FIX: Improved Number Formatting for Pairing Code
+// 🛠️ BUG FIX: Handles 0313..., 313..., and 92313... perfectly for WA API
 function formatPhoneNumberForPairing(phoneNumber) {
     if (!phoneNumber) return '';
-    // 1. Remove all spaces, +, -, and any non-numeric characters
     let num = phoneNumber.toString().replace(/\D/g, ''); 
     
-    // 2. Fix 0092 to 92
     if (num.startsWith('00')) {
         num = num.substring(2);
     }
     
-    // 3. Fix Pakistani local format to international
+    // Automatically convert Pakistani formats to international
     if (num.startsWith('03') && num.length === 11) {
         return '92' + num.substring(1);
     } else if (num.startsWith('3') && num.length === 10) {
         return '92' + num;
     }
     
-    return num; // Return as is for international numbers
+    return num; // Keeps international numbers intact
 }
 
 // ==========================================
@@ -247,8 +245,8 @@ async function startBroadcastWorker(sock, deviceId) {
 // 📱 DYNAMIC DEVICE MANAGER
 // ==========================================
 async function startDevice(phoneNumberId) {
-    if (activeDevices.has(phoneNumberId)) return;
-    activeDevices.add(phoneNumberId);
+    if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
+    activeSockets.set(phoneNumberId, 'initializing');
 
     console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
@@ -269,37 +267,52 @@ async function startDevice(phoneNumberId) {
         generateHighQualityLinkPreview: false
     });
 
-    if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
-                let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                console.log(`[${phoneNumberId}] 🔍 Formatted Number for WA API: "${formattedNumber}"`);
-                console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code...`);
-                
-                const pairingCode = await sock.requestPairingCode(formattedNumber);
-                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
-
-                await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                    pairingCode: pairingCode,
-                    status: 'waiting_for_scan_or_code',
-                    last_updated: new Date().toISOString() 
-                });
-            } catch (err) {
-                console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
-            }
-        }, 3000); 
-    }
+    activeSockets.set(phoneNumberId, sock); // 🛠️ Save socket to memory to kill it later if needed
+    let pairingCodeRequested = false;
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
+        // 🛠️ PERFECT TIMING FIX: Only request pairing code when WhatsApp server emits QR (meaning socket is 100% ready)
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
             
             await fbPatch(`qrcodes/${phoneNumberId}`, { qr_link: qrApiLink, last_updated: new Date().toISOString() });
-            await fbPatch(`bot_requests/${phoneNumberId}`, { qr: qrApiLink, status: 'waiting_for_scan_or_code', last_updated: new Date().toISOString() });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
+
+            if (!sock.authState.creds.registered && !pairingCodeRequested) {
+                pairingCodeRequested = true;
+                
+                // Add a small 2-second delay after QR to ensure server is ready for auth API call
+                setTimeout(async () => {
+                    try {
+                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                        console.log(`[${phoneNumberId}] 🔍 Formatted Number for WA API: "${formattedNumber}"`);
+                        console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code...`);
+                        
+                        const pairingCode = await sock.requestPairingCode(formattedNumber);
+                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
+
+                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                            qr: qrApiLink, // Save both just in case
+                            pairingCode: pairingCode,
+                            status: 'waiting_for_scan_or_code',
+                            last_updated: new Date().toISOString() 
+                        });
+                    } catch (err) {
+                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+                        pairingCodeRequested = false; // Allow retry on next tick
+                    }
+                }, 2000); 
+            } else if (pairingCodeRequested) {
+                // If it refreshes, just update the DB
+                await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                    qr: qrApiLink, 
+                    status: 'waiting_for_scan_or_code',
+                    last_updated: new Date().toISOString() 
+                });
+            }
         }
         
         if (connection === 'open') {
@@ -323,14 +336,14 @@ async function startDevice(phoneNumberId) {
             if (reason === DisconnectReason.loggedOut || reason === 401) {
                 console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
-                activeDevices.delete(phoneNumberId);
+                activeSockets.delete(phoneNumberId);
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected', phone: null });
             } else {
                 console.log(`[${phoneNumberId}] 🔄 Attempting to reconnect...`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
-                activeDevices.delete(phoneNumberId); 
+                activeSockets.delete(phoneNumberId); 
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
@@ -352,12 +365,22 @@ async function pollFirebaseForDevices() {
                 const reqData = requests[phoneId];
                 if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
                     const sessionDir = `sessions_${phoneId}`;
-                    // 🛠️ BUG FIX: Ensure old corrupted sessions are completely deleted before generating code
+                    
+                    // 🛑 BUG FIX: KILL ZOMBIE SOCKETS
+                    // If user requested a code multiple times, kill the old connection before making a new one!
+                    if (activeSockets.has(phoneId)) {
+                        console.log(`[${phoneId}] 🛑 Killing old background socket to prevent conflicts...`);
+                        const oldSock = activeSockets.get(phoneId);
+                        if (oldSock && oldSock.ws) {
+                            oldSock.ws.close(); // Forcefully terminate the old websocket
+                        }
+                        activeSockets.delete(phoneId);
+                    }
+
                     if (fs.existsSync(sessionDir)) {
                         console.log(`[${phoneId}] 🧹 Cleaning old session data before new pairing code...`);
                         fs.rmSync(sessionDir, { recursive: true, force: true });
                     }
-                    activeDevices.delete(phoneId); // 🛠️ Allow the script to restart fresh
 
                     await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
                     startDevice(phoneId);
@@ -369,10 +392,10 @@ async function pollFirebaseForDevices() {
         if (devices) {
             for (const deviceId in devices) {
                 const deviceData = devices[deviceId];
-                if ((deviceData.status === 'pending' || deviceData.status === 'reconnecting') && !activeDevices.has(deviceId)) {
+                if ((deviceData.status === 'pending' || deviceData.status === 'reconnecting') && !activeSockets.has(deviceId)) {
                     startDevice(deviceId);
                 } 
-                else if (deviceData.status === 'connected' && !activeDevices.has(deviceId)) {
+                else if (deviceData.status === 'connected' && !activeSockets.has(deviceId)) {
                     startDevice(deviceId);
                 }
             }
@@ -387,7 +410,7 @@ async function pollFirebaseForDevices() {
 // 💓 GITHUB ACTIONS HEARTBEAT
 // ==========================================
 setInterval(() => {
-    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeDevices.size} | Time: ${new Date().toISOString()}`);
+    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeSockets.size} | Time: ${new Date().toISOString()}`);
 }, 5 * 60 * 1000); 
 
 // ==========================================
