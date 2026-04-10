@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const http = require('http'); // 🌐 Node.js Built-in HTTP (100% Error Free for Render)
@@ -15,7 +15,7 @@ process.on('unhandledRejection', (reason, p) => {
 });
 
 const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
-const activeSockets = new Map(); // 🛠️ BUG FIX: Changed from Set to Map to track and kill zombie sockets
+const activeSockets = new Map(); // 🛠️ Zombie Socket Killer Manager
 
 // ==========================================
 // 🌐 NATIVE HTTP SERVER (FOR RENDER 24/7 UPTIME)
@@ -114,37 +114,19 @@ function formatNumber(phone) {
     return phone.replace(/\D/g, ''); 
 }
 
-// 🛠️ PERFECTED NUMBER FORMATTING FOR FRONTEND (BASED ON SCREENSHOT)
+// 🔙 REVERTED TO YOUR OLD WORKING NUMBER FORMATTER
 function formatPhoneNumberForPairing(phoneNumber) {
-    if (!phoneNumber) return '';
-    
-    // سب سے پہلے نمبر میں سے تمام غیر ضروری حروف (+، اسپیس، ڈیش) نکال دیں
     let num = phoneNumber.toString().replace(/\D/g, ''); 
-    
-    if (num.startsWith('00')) {
-        num = num.substring(2);
-    }
-    
-    // اگر یوزر نے پہلے ہی 92 لگا دیا ہے (مثلاً 923001234567)
-    if (num.startsWith('92') && num.length === 12) {
-        return num;
-    }
-    
-    // اگر یوزر نے 03 سے نمبر لکھا ہے (مثلاً 03001234567)
-    if (num.startsWith('03') && num.length === 11) {
+    if (num.startsWith('03')) {
         return '92' + num.substring(1);
-    } 
-    
-    // اگر یوزر نے بغیر 0 کے لکھا ہے، جو کہ آپ کی ویب سائٹ کی UI کے مطابق ہے (مثلاً 3001234567)
-    if (num.startsWith('3') && num.length === 10) {
+    } else if (num.startsWith('3') && num.length === 10) {
         return '92' + num;
     }
-    
-    return num; // باقی تمام صورتوں میں جو نمبر ہے وہی واپس کر دے
+    return num;
 }
 
 // ==========================================
-// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC (UPDATED)
+// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC 
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -252,7 +234,7 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER
+// 📱 DYNAMIC DEVICE MANAGER (RESTORED TO OLD WORKING LOGIC)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
@@ -271,59 +253,51 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        // 🔴 BUG FIX: Changed Browser Config. This is STRICTLY required for Pairing Code to work without error.
-        browser: ["Ubuntu", "Chrome", "20.0.04"], 
+        browser: Browsers.ubuntu('Chrome'), // 🔙 REVERTED: Using your old working Browser Config
         syncFullHistory: false,
         qrTimeout: 50000,
         generateHighQualityLinkPreview: false
     });
 
-    activeSockets.set(phoneNumberId, sock); // 🛠️ Save socket to memory to kill it later if needed
-    let pairingCodeRequested = false;
+    activeSockets.set(phoneNumberId, sock); // Keep track of socket for zombie killing
+
+    // 🔙 REVERTED TO OLD WORKING LOGIC: Request code OUTSIDE connection.update
+    if (!sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code for: ${formattedNumber}...`);
+                const pairingCode = await sock.requestPairingCode(formattedNumber);
+                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
+
+                await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                    pairingCode: pairingCode,
+                    status: 'waiting_for_scan_or_code',
+                    last_updated: new Date().toISOString() 
+                });
+            } catch (err) {
+                console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+            }
+        }, 3000); 
+    }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🛠️ PERFECT TIMING FIX: Only request pairing code when WhatsApp server emits QR (meaning socket is 100% ready)
+        // Handle QR if requested
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
             
             await fbPatch(`qrcodes/${phoneNumberId}`, { qr_link: qrApiLink, last_updated: new Date().toISOString() });
+            
+            // Note: Pairing code is already requested outside, so we just update the DB with QR if needed
+            await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                qr: qrApiLink, 
+                status: 'waiting_for_scan_or_code',
+                last_updated: new Date().toISOString() 
+            });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
-
-            if (!sock.authState.creds.registered && !pairingCodeRequested) {
-                pairingCodeRequested = true;
-                
-                // 🔴 BUG FIX: Increased delay to 3 seconds to ensure WebSocket is fully stable for code request
-                setTimeout(async () => {
-                    try {
-                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                        console.log(`[${phoneNumberId}] 🔍 Formatted Number for WA API: "${formattedNumber}"`);
-                        console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code...`);
-                        
-                        const pairingCode = await sock.requestPairingCode(formattedNumber);
-                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
-
-                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                            qr: qrApiLink, // Save both just in case
-                            pairingCode: pairingCode,
-                            status: 'waiting_for_scan_or_code',
-                            last_updated: new Date().toISOString() 
-                        });
-                    } catch (err) {
-                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
-                        pairingCodeRequested = false; // Allow retry on next tick
-                    }
-                }, 3000); 
-            } else if (pairingCodeRequested) {
-                // If it refreshes, just update the DB
-                await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                    qr: qrApiLink, 
-                    status: 'waiting_for_scan_or_code',
-                    last_updated: new Date().toISOString() 
-                });
-            }
         }
         
         if (connection === 'open') {
