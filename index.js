@@ -2,12 +2,11 @@ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
-const http = require('http'); // 🌐 Node.js Built-in HTTP module (No npm install required!)
+const http = require('http'); // 🌐 Node.js Built-in HTTP (100% Error Free for Render)
 
 // ==========================================
 // 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
 // ==========================================
-// Prevents the Node.js process from crashing completely on unexpected errors
 process.on('uncaughtException', function (err) {
     console.error('🛡️ [ANTI-CRASH] Caught exception: ', err.message);
 });
@@ -21,7 +20,6 @@ const activeDevices = new Set();
 // ==========================================
 // 🌐 NATIVE HTTP SERVER (FOR RENDER 24/7 UPTIME)
 // ==========================================
-// This replaces Express. It uses zero external dependencies so you won't get MODULE_NOT_FOUND
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
@@ -35,7 +33,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`🌐 Native Web server is listening on port ${PORT} (Prevents Render Deploy Failures)`);
+    console.log(`🌐 Web server is listening on port ${PORT} (Prevents Render Deploy Failures)`);
 });
 
 // ==========================================
