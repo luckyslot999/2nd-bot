@@ -2,7 +2,7 @@ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
-const express = require('express'); // 🌐 Added Express for Render stability
+const http = require('http'); // 🌐 Node.js Built-in HTTP module (No npm install required!)
 
 // ==========================================
 // 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
@@ -19,21 +19,23 @@ const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
 const activeDevices = new Set();
 
 // ==========================================
-// 🌐 EXPRESS SERVER (FOR RENDER 24/7 UPTIME)
+// 🌐 NATIVE HTTP SERVER (FOR RENDER 24/7 UPTIME)
 // ==========================================
-const app = express();
+// This replaces Express. It uses zero external dependencies so you won't get MODULE_NOT_FOUND
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => {
-    res.send('Bot is running continuously on Render! 🚀');
+const server = http.createServer((req, res) => {
+    if (req.url === '/ping') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('pong');
+    } else {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Bot is running continuously on Render! 🚀');
+    }
 });
 
-app.get('/ping', (req, res) => {
-    res.status(200).send('pong');
-});
-
-app.listen(PORT, () => {
-    console.log(`🌐 Express server is listening on port ${PORT} (Required for Render Deployment)`);
+server.listen(PORT, () => {
+    console.log(`🌐 Native Web server is listening on port ${PORT} (Prevents Render Deploy Failures)`);
 });
 
 // ==========================================
@@ -431,7 +433,6 @@ setInterval(() => {
 // 🚀 INITIALIZATION WRAPPED IN TRY-CATCH
 // ==========================================
 if (!FIREBASE_URL) { 
-    // Removed process.exit(1) to prevent the server from crashing
     console.error("❌ FIREBASE_URL is missing in .env file! Bot logic will not run, but web server remains online.");
 } else {
     try {
