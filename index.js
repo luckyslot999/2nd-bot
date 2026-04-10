@@ -242,7 +242,7 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER
+// 📱 DYNAMIC DEVICE MANAGER (FIXED PAIRING CODE)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
@@ -261,19 +261,41 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), 
+        // 🛠️ FIX 1: Browser array prevents "Couldn't link device" errors
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], 
         syncFullHistory: false,
         qrTimeout: 50000,
         generateHighQualityLinkPreview: false
     });
 
-    activeSockets.set(phoneNumberId, sock); // 🛠️ Save socket to memory to kill it later if needed
-    let pairingCodeRequested = false;
+    activeSockets.set(phoneNumberId, sock);
+
+    // 🛠️ FIX 2: Moved pairing code request OUTSIDE the QR event listener
+    if (!sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                console.log(`[${phoneNumberId}] 🔍 Formatted Number for WA API: "${formattedNumber}"`);
+                console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code...`);
+                
+                const pairingCode = await sock.requestPairingCode(formattedNumber);
+                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
+
+                await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                    pairingCode: pairingCode,
+                    status: 'waiting_for_scan_or_code',
+                    last_updated: new Date().toISOString() 
+                });
+            } catch (err) {
+                console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+            }
+        }, 4000); // Wait 4 seconds after socket starts to request code
+    }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🛠️ PERFECT TIMING FIX: Only request pairing code when WhatsApp server emits QR (meaning socket is 100% ready)
+        // QR Code is now processed independently of the pairing code
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
@@ -281,38 +303,11 @@ async function startDevice(phoneNumberId) {
             await fbPatch(`qrcodes/${phoneNumberId}`, { qr_link: qrApiLink, last_updated: new Date().toISOString() });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
 
-            if (!sock.authState.creds.registered && !pairingCodeRequested) {
-                pairingCodeRequested = true;
-                
-                // Add a small 2-second delay after QR to ensure server is ready for auth API call
-                setTimeout(async () => {
-                    try {
-                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                        console.log(`[${phoneNumberId}] 🔍 Formatted Number for WA API: "${formattedNumber}"`);
-                        console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code...`);
-                        
-                        const pairingCode = await sock.requestPairingCode(formattedNumber);
-                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
-
-                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                            qr: qrApiLink, // Save both just in case
-                            pairingCode: pairingCode,
-                            status: 'waiting_for_scan_or_code',
-                            last_updated: new Date().toISOString() 
-                        });
-                    } catch (err) {
-                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
-                        pairingCodeRequested = false; // Allow retry on next tick
-                    }
-                }, 2000); 
-            } else if (pairingCodeRequested) {
-                // If it refreshes, just update the DB
-                await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                    qr: qrApiLink, 
-                    status: 'waiting_for_scan_or_code',
-                    last_updated: new Date().toISOString() 
-                });
-            }
+            await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                qr: qrApiLink, 
+                status: 'waiting_for_scan_or_code',
+                last_updated: new Date().toISOString() 
+            });
         }
         
         if (connection === 'open') {
@@ -367,12 +362,11 @@ async function pollFirebaseForDevices() {
                     const sessionDir = `sessions_${phoneId}`;
                     
                     // 🛑 BUG FIX: KILL ZOMBIE SOCKETS
-                    // If user requested a code multiple times, kill the old connection before making a new one!
                     if (activeSockets.has(phoneId)) {
                         console.log(`[${phoneId}] 🛑 Killing old background socket to prevent conflicts...`);
                         const oldSock = activeSockets.get(phoneId);
                         if (oldSock && oldSock.ws) {
-                            oldSock.ws.close(); // Forcefully terminate the old websocket
+                            oldSock.ws.close(); 
                         }
                         activeSockets.delete(phoneId);
                     }
