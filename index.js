@@ -1,5 +1,4 @@
 
-
 require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -60,14 +59,14 @@ async function fbDelete(path) {
 }
 
 // ==========================================
-// ⚙️ SETTINGS (NO DAILY LIMIT & 15 MIN DELAY)
+// ⚙️ SETTINGS (INFINITE LOOP & 15 MIN DELAY)
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
     return { 
         messageTemplate: data?.messageTemplate || "Hello, this is an automated message from Botzmine!", 
-        minDelayMinutes: 15,     // 👈 Har 15 Minutes Baad
-        maxDelayMinutes: 16      // 👈 15-16 mins k darmian bhejay ga (WhatsApp Ban se bachne k liye)
+        minDelayMinutes: 15,     // 👈 15 Minutes Gap
+        maxDelayMinutes: 16      
     };
 }
 
@@ -119,9 +118,11 @@ async function startBroadcastWorker(sock, deviceId) {
             let stats = await fbGet(`devices/${deviceId}`);
             const today = new Date().toISOString().split('T')[0];
             
+            // Limit check hata di gayi hai (Infinite Loop)
+            
             let rawPhone = await getNextPendingNumber();
             if (!rawPhone) {
-                setTimeout(runWorker, 30000); // Agar number nahi hain tou 30 sec baad dubara check kare
+                setTimeout(runWorker, 30000);
                 return;
             }
             
@@ -133,31 +134,28 @@ async function startBroadcastWorker(sock, deviceId) {
             await delay(Math.random() * 5000 + 3000);
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
-            // 👈 Ye line 24-hours wale disconnect logic ko refresh karti hai
-            const timestamp = new Date().toISOString(); 
-            
+            const timestamp = new Date().toISOString();
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
                 date: today, 
                 lastActive: timestamp, 
-                status: 'connected' // 👈 Message jatay he permanently connected show hoga
+                status: 'connected' // 👈 Keeps status connected permanently
             });
 
             console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in ~15 mins.`);
-            // Infinite lagatar chalta rahega har 15 minute baad
             setTimeout(runWorker, getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes));
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Error:`, error.message);
-            setTimeout(runWorker, 60000); // Agar koi error aye tou 1 minute baad dubara try kare
+            setTimeout(runWorker, 20000); 
         }
     };
     runWorker();
 }
 
 // ==========================================
-// 📱 DEVICE MANAGER
+// 📱 DEVICE MANAGER (ORIGINAL LOGIC MAINTAINED)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
@@ -179,6 +177,7 @@ async function startDevice(phoneNumberId) {
 
     activeSockets.set(phoneNumberId, sock);
 
+    // 👈 ORIGINAL PAIRING CODE LOGIC (100% UNTOUCHED)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -212,13 +211,12 @@ async function startDevice(phoneNumberId) {
             activeSockets.delete(phoneNumberId);
 
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                // User ne khud WhatsApp se Log out kiya
-                console.log(`❌ [${phoneNumberId}] LOGGED OUT BY USER`);
+                console.log(`❌ [${phoneNumberId}] LOGGED OUT`);
                 fs.rmSync(sessionDir, { recursive: true, force: true });
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
             } else {
-                // Network drop ki waja se connection close hua (Hum DB mein disconnected nahi show karwayenge)
-                console.log(`🔄 [${phoneNumberId}] RECONNECTING IN BACKGROUND...`);
+                console.log(`🔄 [${phoneNumberId}] RECONNECTING...`);
+                // 👈 Yahan se `status: reconnecting` DB mein update karna hata dia hai taake user ko hamesha "connected" hi show ho.
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
@@ -240,13 +238,13 @@ async function checkInactiveDevices() {
     for (const deviceId in devices) {
         const device = devices[deviceId];
         
-        // Agar device pehle se disconnected nahi hai aur uski lastActive detail majood hai
+        // Agar device already disconnected nahi hai, aur uski lastActive ki detail majood hai
         if (device.status !== 'disconnected' && device.lastActive) {
             const lastActiveTime = new Date(device.lastActive).getTime();
             
-            // 👈 Agar pichle 24 ghante mein ek bhi message send nahi hua
+            // Agar pichle 24 ghante se koi activity/message nahi hua
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
-                console.log(`⚠️ [${deviceId}] No message sent for 24 hours. Marking as disconnected...`);
+                console.log(`⚠️ [${deviceId}] No activity for 24 hours. Marking as disconnected...`);
                 
                 // 1. Firebase mein status update karein
                 await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
@@ -262,7 +260,7 @@ async function checkInactiveDevices() {
                     activeSockets.delete(deviceId);
                 }
 
-                // 3. Local session files ko delete karein taake woh dobara connect mangay
+                // 3. Local session files ko delete karein taake woh dobara scan maangay
                 const sessionDir = `sessions_${deviceId}`;
                 if (fs.existsSync(sessionDir)) {
                     fs.rmSync(sessionDir, { recursive: true, force: true });
