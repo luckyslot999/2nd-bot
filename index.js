@@ -64,7 +64,7 @@ async function getSettings() {
     const data = await fbGet('settings');
     return { 
         messageTemplate: data?.messageTemplate || "Hello, this is an automated message from Botzmine!", 
-        delayMinutes: 20 // 👈 Updated: Har 20 minute baad message jayega
+        delayMinutes: 20 
     };
 }
 
@@ -76,7 +76,7 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 NUMBER FETCHING LOGIC 
+// 🔄 NUMBER FETCHING LOGIC (STRENGTHENED)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -87,34 +87,33 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop (Agar sab numbers ko message chala gaya to restart karega)
-    console.log(`♻️ [AUTO-LOOP] Resetting numbers...`);
+    // Auto-Reset Loop: Agar sab numbers ho gaye to dobara pending kar do (24/7 marketing ke liye)
+    console.log(`♻️ [AUTO-LOOP] All numbers finished. Resetting queue for continuous sending...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    return getNextPendingNumber();
+    
+    // Reset ke baad foran pehla number uthao
+    const firstNum = Object.keys(numbers)[0];
+    return firstNum;
 }
 
 // ==========================================
-// 🚀 BROADCAST WORKER (NON-STOP MODE)
+// 🚀 BROADCAST WORKER (FIXED FOR 24/7)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     const runWorker = async () => {
         try {
-            // Check if socket is still active
             if (!activeSockets.has(deviceId)) return;
 
             const settings = await getSettings();
-            let stats = await fbGet(`devices/${deviceId}`);
-            const today = new Date().toISOString().split('T')[0];
-            
-            // Daily limit wala hissa khatam kar diya gaya hai. Ab lagatar chalega.
-
             let rawPhone = await getNextPendingNumber();
+            
             if (!rawPhone) {
-                setTimeout(runWorker, 30000); // Agar number na mile to 30 second baad dobara check karega
+                console.log(`[${deviceId}] 😴 No numbers in DB. Waiting 1 minute...`);
+                setTimeout(runWorker, 60000); 
                 return;
             }
             
@@ -123,36 +122,42 @@ async function startBroadcastWorker(sock, deviceId) {
             
             console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             await sock.sendPresenceUpdate('composing', jid);
-            await delay(Math.random() * 5000 + 3000);
+            await delay(5000); // 5 second typing simulator
+            
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
             const timestamp = new Date().toISOString();
+            const today = timestamp.split('T')[0];
+            let stats = await fbGet(`devices/${deviceId}`);
+
+            // Update Firebase status
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
-            
-            // Jab bhi message jayega, lastActive update hoga (Is se 24 hour rule control hoga)
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
                 date: today, 
                 lastActive: timestamp, 
-                status: 'connected' // 👈 Message gaya to matlab completely connected/active hai
+                status: 'connected' 
             });
 
-            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
-            setTimeout(runWorker, settings.delayMinutes * 60 * 1000); // 20 منٹ کا وقفہ
+            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next message in 20 mins.`);
+            
+            // Strictly 20 Minutes Delay
+            setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
-            console.log(`[${deviceId}] ❌ Error:`, error.message);
-            setTimeout(runWorker, 20000); 
+            console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
+            // Error ki surat mein 30 second baad dobara try karega taake loop na toote
+            setTimeout(runWorker, 30000); 
         }
     };
     runWorker();
 }
 
 // ==========================================
-// 📱 DEVICE MANAGER (PAIRING CODE & CONNECTION)
+// 📱 DEVICE MANAGER (IMPROVED RECONNECTION)
 // ==========================================
 async function startDevice(phoneNumberId) {
-    if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
+    if (activeSockets.has(phoneNumberId) && typeof activeSockets.get(phoneNumberId) !== 'string') return;
     activeSockets.set(phoneNumberId, 'initializing');
 
     const sessionDir = `sessions_${phoneNumberId}`;
@@ -166,7 +171,10 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome')
+        browser: Browsers.ubuntu('Chrome'),
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000
     });
 
     activeSockets.set(phoneNumberId, sock);
@@ -189,31 +197,28 @@ async function startDevice(phoneNumberId) {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'open') {
-            console.log(`✅ [${phoneNumberId}] CONNECTED`);
+            console.log(`✅ [${phoneNumberId}] CONNECTED AND ACTIVE`);
             await fbDelete(`bot_requests/${phoneNumberId}`);
-            
-            // Connection khulte hi status connected mark ho jayega
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: sock.user.id.split(':')[0], 
                 lastActive: new Date().toISOString() 
             });
-            setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
+            // Worker start
+            startBroadcastWorker(sock, phoneNumberId);
         }
         
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             activeSockets.delete(phoneNumberId);
 
-            // Sirf khud logout karne par ya account ban hone par disconnected hoga
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 console.log(`❌ [${phoneNumberId}] LOGGED OUT`);
-                fs.rmSync(sessionDir, { recursive: true, force: true });
+                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
             } else {
-                console.log(`🔄 [${phoneNumberId}] RECONNECTING...`);
-                // Agar internet masla ho to connected hi rakhte hue reconnect try karega
-                await fbPatch(`devices/${phoneNumberId}`, { status: 'connected' }); 
+                console.log(`🔄 [${phoneNumberId}] NETWORK DROP, RECONNECTING...`);
+                // Network issue par status 'connected' hi rahega taake dashboard par disconnect na dikhaye
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
@@ -223,44 +228,24 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🕒 24-HOUR INACTIVITY CHECKER
+// 🕒 24-HOUR SAFETY CHECK (REDUCED STRICTNESS)
 // ==========================================
 async function checkInactiveDevices() {
     const devices = await fbGet('devices');
     if (!devices) return;
 
     const now = new Date().getTime();
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000; 
 
     for (const deviceId in devices) {
         const device = devices[deviceId];
-        
-        // Agar device already disconnected nahi hai, aur uski lastActive ki detail majood hai
-        if (device.status !== 'disconnected' && device.lastActive) {
+        if (device.status === 'connected' && device.lastActive) {
             const lastActiveTime = new Date(device.lastActive).getTime();
-            
-            // Agar pichle 24 ghante mein 1 bhi message send nahi hua
+            // Agar wakai 24 ghante se koi activity nahi hui to hi handle karein
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
-                console.log(`⚠️ [${deviceId}] No message sent in 24 hours. Marking as disconnected...`);
-                
-                // 1. Firebase mein status update karein
-                await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
-                
-                // 2. Memory mein se active socket khatam karein
-                if (activeSockets.has(deviceId)) {
-                    try {
-                        const sock = activeSockets.get(deviceId);
-                        if (sock && typeof sock.ws?.close === 'function') {
-                            sock.ws.close();
-                        }
-                    } catch (e) {}
-                    activeSockets.delete(deviceId);
-                }
-
-                // 3. Local session files ko delete karein taake woh dobara code maangay
-                const sessionDir = `sessions_${deviceId}`;
-                if (fs.existsSync(sessionDir)) {
-                    fs.rmSync(sessionDir, { recursive: true, force: true });
+                console.log(`⚠️ [${deviceId}] No activity for 24h. Validating...`);
+                if (!activeSockets.has(deviceId)) {
+                   await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
                 }
             }
         }
@@ -268,11 +253,11 @@ async function checkInactiveDevices() {
 }
 
 // ==========================================
-// 🔄 SYSTEM POLLING
+// 🔄 SYSTEM POLLING (STAYS ALERT)
 // ==========================================
 async function pollFirebase() {
-    // 10 second delay for regular requests
     setInterval(async () => {
+        // Pairing requests
         const requests = await fbGet('bot_requests');
         if (requests) {
             for (const id in requests) {
@@ -283,28 +268,26 @@ async function pollFirebase() {
             }
         }
 
+        // Auto-Restart disconnected but active sessions
         const devices = await fbGet('devices');
         if (devices) {
             for (const id in devices) {
-                if ((devices[id].status === 'pending' || devices[id].status === 'connected') && !activeSockets.has(id)) {
+                if (devices[id].status === 'connected' && !activeSockets.has(id)) {
                     startDevice(id);
                 }
             }
         }
-    }, 10000);
+    }, 15000);
 
-    // Har 5 minute baad 24-hours wala Inactivity Check run hoga
-    setInterval(() => {
-        checkInactiveDevices();
-    }, 5 * 60 * 1000); 
+    setInterval(() => checkInactiveDevices(), 10 * 60 * 1000); 
 }
 
 // ==========================================
-// 🚀 START
+// 🚀 START ENGINE
 // ==========================================
 if (FIREBASE_URL) {
     pollFirebase();
-    console.log("🚀 Botzmine Engine Started!");
+    console.log("🚀 Botzmine Engine 24/7 Started Successfully!");
 } else {
     console.error("❌ FIREBASE_URL missing!");
 }
