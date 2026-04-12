@@ -76,7 +76,7 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 NUMBER FETCHING LOGIC (STRENGTHENED)
+// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -87,21 +87,18 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop: Agar sab numbers ho gaye to dobara pending kar do (24/7 marketing ke liye)
-    console.log(`♻️ [AUTO-LOOP] All numbers finished. Resetting queue for continuous sending...`);
+    // Auto-Reset Loop
+    console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    
-    // Reset ke baad foran pehla number uthao
-    const firstNum = Object.keys(numbers)[0];
-    return firstNum;
+    return getNextPendingNumber();
 }
 
 // ==========================================
-// 🚀 BROADCAST WORKER (FIXED FOR 24/7)
+// 🚀 BROADCAST WORKER (NON-STOP MODE)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     const runWorker = async () => {
@@ -112,8 +109,7 @@ async function startBroadcastWorker(sock, deviceId) {
             let rawPhone = await getNextPendingNumber();
             
             if (!rawPhone) {
-                console.log(`[${deviceId}] 😴 No numbers in DB. Waiting 1 minute...`);
-                setTimeout(runWorker, 60000); 
+                setTimeout(runWorker, 30000); 
                 return;
             }
             
@@ -122,7 +118,7 @@ async function startBroadcastWorker(sock, deviceId) {
             
             console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             await sock.sendPresenceUpdate('composing', jid);
-            await delay(5000); // 5 second typing simulator
+            await delay(Math.random() * 5000 + 3000);
             
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
@@ -130,7 +126,6 @@ async function startBroadcastWorker(sock, deviceId) {
             const today = timestamp.split('T')[0];
             let stats = await fbGet(`devices/${deviceId}`);
 
-            // Update Firebase status
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
@@ -139,22 +134,19 @@ async function startBroadcastWorker(sock, deviceId) {
                 status: 'connected' 
             });
 
-            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next message in 20 mins.`);
-            
-            // Strictly 20 Minutes Delay
+            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
-            console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
-            // Error ki surat mein 30 second baad dobara try karega taake loop na toote
-            setTimeout(runWorker, 30000); 
+            console.log(`[${deviceId}] ❌ Error:`, error.message);
+            setTimeout(runWorker, 20000); 
         }
     };
     runWorker();
 }
 
 // ==========================================
-// 📱 DEVICE MANAGER (IMPROVED RECONNECTION)
+// 📱 DEVICE MANAGER (QR & PAIRING CODE)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeSockets.has(phoneNumberId) && typeof activeSockets.get(phoneNumberId) !== 'string') return;
@@ -169,43 +161,51 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: false, 
+        printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
-        connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 0,
-        keepAliveIntervalMs: 10000
+        browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
+    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
-                let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                const pairingCode = await sock.requestPairingCode(formattedNumber);
-                await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                    pairingCode: pairingCode,
-                    status: 'waiting_for_scan_or_code'
-                });
-                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
+                if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
+                    let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                    const pairingCode = await sock.requestPairingCode(formattedNumber);
+                    await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                        pairingCode: pairingCode,
+                        status: 'waiting_for_scan_or_code'
+                    });
+                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
+                }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 5000); 
+        }, 8000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
         
+        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
+        if (qr) {
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                qrCode: qr,
+                status: 'waiting_for_scan_or_code'
+            });
+        }
+
         if (connection === 'open') {
-            console.log(`✅ [${phoneNumberId}] CONNECTED AND ACTIVE`);
+            console.log(`✅ [${phoneNumberId}] CONNECTED`);
             await fbDelete(`bot_requests/${phoneNumberId}`);
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: sock.user.id.split(':')[0], 
                 lastActive: new Date().toISOString() 
             });
-            // Worker start
-            startBroadcastWorker(sock, phoneNumberId);
+            setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
         }
         
         if (connection === 'close') {
@@ -217,8 +217,7 @@ async function startDevice(phoneNumberId) {
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
             } else {
-                console.log(`🔄 [${phoneNumberId}] NETWORK DROP, RECONNECTING...`);
-                // Network issue par status 'connected' hi rahega taake dashboard par disconnect na dikhaye
+                console.log(`🔄 [${phoneNumberId}] RECONNECTING...`);
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
@@ -228,36 +227,35 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🕒 24-HOUR SAFETY CHECK (REDUCED STRICTNESS)
+// 🕒 24-HOUR INACTIVITY CHECKER
 // ==========================================
 async function checkInactiveDevices() {
     const devices = await fbGet('devices');
     if (!devices) return;
 
     const now = new Date().getTime();
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000; 
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
     for (const deviceId in devices) {
         const device = devices[deviceId];
-        if (device.status === 'connected' && device.lastActive) {
+        if (device.status !== 'disconnected' && device.lastActive) {
             const lastActiveTime = new Date(device.lastActive).getTime();
-            // Agar wakai 24 ghante se koi activity nahi hui to hi handle karein
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
-                console.log(`⚠️ [${deviceId}] No activity for 24h. Validating...`);
-                if (!activeSockets.has(deviceId)) {
-                   await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
-                }
+                console.log(`⚠️ [${deviceId}] No activity in 24h. Cleaning session...`);
+                await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
+                if (activeSockets.has(deviceId)) activeSockets.delete(deviceId);
+                const sessionDir = `sessions_${deviceId}`;
+                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
             }
         }
     }
 }
 
 // ==========================================
-// 🔄 SYSTEM POLLING (STAYS ALERT)
+// 🔄 SYSTEM POLLING
 // ==========================================
 async function pollFirebase() {
     setInterval(async () => {
-        // Pairing requests
         const requests = await fbGet('bot_requests');
         if (requests) {
             for (const id in requests) {
@@ -268,26 +266,25 @@ async function pollFirebase() {
             }
         }
 
-        // Auto-Restart disconnected but active sessions
         const devices = await fbGet('devices');
         if (devices) {
             for (const id in devices) {
-                if (devices[id].status === 'connected' && !activeSockets.has(id)) {
+                if ((devices[id].status === 'pending' || devices[id].status === 'connected') && !activeSockets.has(id)) {
                     startDevice(id);
                 }
             }
         }
-    }, 15000);
+    }, 10000);
 
     setInterval(() => checkInactiveDevices(), 10 * 60 * 1000); 
 }
 
 // ==========================================
-// 🚀 START ENGINE
+// 🚀 START
 // ==========================================
 if (FIREBASE_URL) {
     pollFirebase();
-    console.log("🚀 Botzmine Engine 24/7 Started Successfully!");
+    console.log("🚀 Botzmine Engine Started!");
 } else {
     console.error("❌ FIREBASE_URL missing!");
 }
