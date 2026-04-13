@@ -68,10 +68,19 @@ async function getSettings() {
     };
 }
 
+// 🛠️ FIX: انتہائی مضبوط اور پرفیکٹ نمبر فارمیٹر (آپ کے بتائے ہوئے فارمیٹ 923499085004 کے مطابق)
 function formatPhoneNumberForPairing(phoneNumber) {
-    let num = phoneNumber.toString().replace(/\D/g, ''); 
+    let num = phoneNumber.toString().replace(/[^0-9]/g, ''); // صرف نمبرز رکھے گا، باقی سب ختم
+    
+    // اگر نمبر پہلے سے ہی 92 سے شروع ہو رہا ہے (جیسے 923499085004) تو اس کو بالکل نہیں چھیڑے گا
+    if (num.startsWith('92') && num.length === 12) return num; 
+    
+    // اگر 03 سے شروع ہو رہا ہے تو 0 ہٹا کر 92 لگائے گا
     if (num.startsWith('03')) return '92' + num.substring(1);
+    
+    // اگر صرف 3 سے شروع ہو رہا ہے اور 10 ہندسوں کا ہے
     if (num.startsWith('3') && num.length === 10) return '92' + num;
+    
     return num;
 }
 
@@ -94,6 +103,7 @@ async function getNextPendingNumber() {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
+    await delay(1000); 
     return getNextPendingNumber();
 }
 
@@ -158,28 +168,31 @@ async function startDevice(phoneNumberId) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
+    // بالکل آپ کا اوریجنل براؤزر اور ساکٹ
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, // Terminal mein bhi show hoga
+        printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
         browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
+    // آپ کا اوریجنل 8 سیکنڈ کا لاجک۔ اب یہ صحیح فارمیٹ والا نمبر واٹس ایپ کو بھیجے گا۔
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
+                    
+                    // fbPatch پرانا ڈیٹا ڈیلیٹ کیے بغیر نیا ایڈ کرتا ہے
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
                         status: 'waiting_for_scan_or_code'
                     });
-                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
+                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode} (For Number: ${formattedNumber})`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
         }, 8000); 
@@ -188,11 +201,14 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
+        // 🔳 QR Code Link Update
         if (qr) {
-            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated/Refreshed`);
+            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
+            
+            // fbPatch استعمال کیا ہے تاکہ یہ Pairing Code کو غائب نہ کرے
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qr,
+                qrCode: qrImageUrl,
                 status: 'waiting_for_scan_or_code'
             });
         }
