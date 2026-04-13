@@ -69,8 +69,7 @@ async function getSettings() {
 }
 
 function formatPhoneNumberForPairing(phoneNumber) {
-    let num = phoneNumber.toString().replace(/[^0-9]/g, ''); 
-    if (num.startsWith('92') && num.length === 12) return num; 
+    let num = phoneNumber.toString().replace(/\D/g, ''); 
     if (num.startsWith('03')) return '92' + num.substring(1);
     if (num.startsWith('3') && num.length === 10) return '92' + num;
     return num;
@@ -88,13 +87,14 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
+    // Auto-Reset Loop
     console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    await delay(1000); 
+    await delay(1000); // Only added to prevent server crash during reset
     return getNextPendingNumber();
 }
 
@@ -162,26 +162,25 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, 
+        printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
-        // 🛠️ FIX FOR 2024 PAIRING: Changed to Windows Chrome for max trust
-        browser: Browsers.windows('Chrome') 
+        browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
+    // Pairing Code Request (اگر 8 سیکنڈ تک QR اسکین نہ ہوا) - Your exact original logic
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
-                    
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
                         status: 'waiting_for_scan_or_code'
                     });
-                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode} (For Number: ${formattedNumber})`);
+                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
         }, 8000); 
@@ -190,10 +189,10 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
+        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
         if (qr) {
             console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
                 qrCode: qrImageUrl,
                 status: 'waiting_for_scan_or_code'
@@ -255,28 +254,14 @@ async function checkInactiveDevices() {
 }
 
 // ==========================================
-// 🔄 SYSTEM POLLING (FIXED LOGOUT BUG)
+// 🔄 SYSTEM POLLING
 // ==========================================
 async function pollFirebase() {
     setInterval(async () => {
         const requests = await fbGet('bot_requests');
         if (requests) {
             for (const id in requests) {
-                // 🚨 FIX: اگر یوزر نے ڈس کنیکٹ کا بٹن دبایا ہے تو پرانا سیشن ڈیلیٹ کرو
-                if (requests[id].action === 'logout') {
-                    console.log(`🧹 [${id}] Clearing Corrupted Session...`);
-                    if (activeSockets.has(id)) {
-                        try { activeSockets.get(id).logout(); } catch(e){}
-                        activeSockets.delete(id);
-                    }
-                    const sessionDir = `sessions_${id}`;
-                    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                    
-                    await fbDelete(`bot_requests/${id}`);
-                    await fbPatch(`devices/${id}`, { status: 'disconnected' });
-                }
-                // اور اگر جنریٹ کی ریکویسٹ ہے تو ڈیوائس سٹارٹ کرو
-                else if (requests[id].action === 'generate_qr' && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
+                if (requests[id].action && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
                     await fbPatch(`bot_requests/${id}`, { status: 'processing' });
                     startDevice(id);
                 }
