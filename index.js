@@ -128,12 +128,15 @@ async function startBroadcastWorker(sock, deviceId) {
 
             // Update Database: Mark Number Sent & Update Device Stats
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
+            
+            // ✅ [UPDATE] Updating Both Device and User Nodes to 'connected'
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
                 date: today, 
                 lastActive: timestamp, // Link proven active!
                 status: 'connected' 
             });
+            await fbPatch(`users/${deviceId}`, { status: 'connected', lastActive: timestamp });
 
             console.log(`[${deviceId}] ✅ Successfully sent to ${phone}. Next in ${settings.delayMinutes} mins.`);
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
@@ -212,11 +215,14 @@ async function startDevice(phoneNumberId) {
         if (connection === 'open') {
             console.log(`✅ [${phoneNumberId}] WA CONNECTED SECURELY`);
             await fbDelete(`bot_requests/${phoneNumberId}`); 
+            
+            // ✅ [UPDATE] Keeping both Device & User Nodes Connected
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: sock.user.id.split(':')[0], 
                 lastActive: new Date().toISOString() 
             });
+            await fbPatch(`users/${phoneNumberId}`, { status: 'connected' });
             
             setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
         }
@@ -228,7 +234,10 @@ async function startDevice(phoneNumberId) {
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 console.log(`❌ [${phoneNumberId}] LOGGED OUT BY USER.`);
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+                
+                // ✅ [UPDATE] Mark disconnected in both nodes if intentionally logged out
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
+                await fbPatch(`users/${phoneNumberId}`, { status: 'disconnected' });
             } else {
                 console.log(`🔄 [${phoneNumberId}] CONNECTION DROPPED. RECONNECTING...`);
                 setTimeout(() => startDevice(phoneNumberId), 5000);
@@ -254,7 +263,9 @@ async function checkInactiveDevices() {
         
         // HEARTBEAT: Prevent auto-disconnect if bot is active in server
         if (activeSockets.has(deviceId) && activeSockets.get(deviceId)?.authState?.creds?.registered) {
-            await fbPatch(`devices/${deviceId}`, { lastActive: new Date().toISOString() });
+            const currentTime = new Date().toISOString();
+            await fbPatch(`devices/${deviceId}`, { lastActive: currentTime, status: 'connected' });
+            await fbPatch(`users/${deviceId}`, { status: 'connected' }); // Keep user node connected too
             continue; 
         }
 
@@ -262,10 +273,20 @@ async function checkInactiveDevices() {
             const lastActiveTime = new Date(device.lastActive).getTime();
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
                 console.log(`⚠️ [${deviceId}] No activity for 24h. Cleaning up...`);
+                
+                // ✅ [UPDATE] Ensure both User & Device show disconnected after 24 hours of inactivity
                 await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
+                await fbPatch(`users/${deviceId}`, { status: 'disconnected' });
+                
                 if (activeSockets.has(deviceId)) activeSockets.delete(deviceId);
                 const sessionDir = `sessions_${deviceId}`;
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+            } else {
+                // ✅ [UPDATE] If it's within 24 hours, enforce 'connected' status in both places!
+                if (device.status !== 'connected') {
+                    await fbPatch(`devices/${deviceId}`, { status: 'connected' });
+                    await fbPatch(`users/${deviceId}`, { status: 'connected' });
+                }
             }
         }
     }
@@ -281,6 +302,26 @@ async function pollFirebase() {
             for (const id in requests) {
                 if (requests[id].action && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
                     await fbPatch(`bot_requests/${id}`, { status: 'processing' });
+                    
+                    // 🧹 [NEW UPDATE] - CLEANUP OLD SESSIONS ON NEW REQUEST
+                    // اگر یوزر دوبارہ ریکویسٹ کر رہا ہے تو پُرانا سیشن ڈیلیٹ کریں تاکہ نیا اوریجنل QR/Code بنے
+                    if (activeSockets.has(id)) {
+                        try {
+                            const oldSock = activeSockets.get(id);
+                            if (typeof oldSock !== 'string') {
+                                oldSock.ev.removeAllListeners();
+                                oldSock.ws.close();
+                            }
+                        } catch (err) {}
+                        activeSockets.delete(id);
+                    }
+                    
+                    const sessionDir = `sessions_${id}`;
+                    if (fs.existsSync(sessionDir)) {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                        console.log(`🗑️ [${id}] Old session cleared for a fresh QR/Pairing Code request.`);
+                    }
+
                     startDevice(id);
                 }
             }
