@@ -1,21 +1,29 @@
 {
-  "name": "whatsapp-baileys-bot",
+  "name": "botzmine-whatsapp-bot",
   "version": "1.0.0",
-  "description": "Production ready WhatsApp Bot with QR & Pairing Code",
+  "description": "Botzmine WhatsApp Bot - 24/7 Broadcast Engine",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5",
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "firebase-admin": "^12.1.0",
-    "pino": "^9.0.0",
-    "qrcode": "^1.5.3"
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "pino": "^9.3.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "broadcast"
+  ],
+  "author": "Botzmine",
+  "license": "ISC"
 }
