@@ -68,10 +68,21 @@ async function getSettings() {
     };
 }
 
+// ==========================================
+// 📞 PHONE NUMBER FORMATTER (FIXED)
+// ==========================================
 function formatPhoneNumberForPairing(phoneNumber) {
-    let num = phoneNumber.toString().replace(/\D/g, ''); 
-    if (num.startsWith('03')) return '92' + num.substring(1);
+    // پہلے سارے non-digit characters ہٹائیں
+    let num = phoneNumber.toString().replace(/\D/g, '');
+    
+    // پاکستانی نمبر فارمیٹ
+    if (num.startsWith('03') && num.length === 11) return '92' + num.substring(1);
     if (num.startsWith('3') && num.length === 10) return '92' + num;
+    
+    // اگر پہلے سے country code ہے (92xxxx) تو ویسے ہی رہنے دو
+    if (num.startsWith('92') && num.length === 12) return num;
+    
+    // باقی سب کے لیے بھی واپس کریں
     return num;
 }
 
@@ -133,10 +144,11 @@ async function startBroadcastWorker(sock, deviceId) {
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
                 date: today, 
-                lastActive: timestamp, // Link proven active!
+                lastActive: timestamp,
                 status: 'connected' 
             });
-            await fbPatch(`users/${deviceId}`, { status: 'connected', lastActive: timestamp });
+            // ✅ FIX: waStatus field use کریں (جو Firebase میں اصل field ہے)
+            await fbPatch(`users/${deviceId}`, { waStatus: 'connected', lastActive: timestamp });
 
             console.log(`[${deviceId}] ✅ Successfully sent to ${phone}. Next in ${settings.delayMinutes} mins.`);
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
@@ -167,71 +179,72 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), // 👈 آپ کا اوریجنل براؤزر واپس آ گیا
+        browser: Browsers.ubuntu('Chrome'),
         keepAliveIntervalMs: 30000, // 24/7 Link Protection
         markOnlineOnConnect: true
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    let lastPairingTime = 0; // ⏱️ 60 سیکنڈ چیک کرنے کے لیے ٹائمر ویری ایبل
+    let pairingCodeRequested = false; // ✅ صرف ایک بار pairing code مانگنے کے لیے flag
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 100% FIXED QR & 1-MINUTE PAIRING CODE LOGIC
+        // 🔳 QR & PAIRING CODE LOGIC (FIXED)
         if (qr) {
-            // 1. QR Code Logic (Original)
+            // 1. QR Code - Firebase میں save کریں
             const encodedQr = encodeURIComponent(qr);
             const finalQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodedQr}`;
             
-            console.log(`[${phoneNumberId}] 🔗 Sending FULL URL to Firebase: ${finalQrLink}`);
+            console.log(`[${phoneNumberId}] 🔗 QR Code ready. Updating Firebase...`);
             
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
                 qrCode: finalQrLink, 
+                pairingCode: null,
                 status: 'waiting_for_scan_or_code'
             });
 
-            // 2. PAIRING CODE LOGIC (1-Minute Refresh Rule Fixed)
-            if (!sock.authState.creds.registered) {
-                const currentTime = Date.now();
+            // 2. PAIRING CODE - صرف ایک بار مانگیں جب registered نہ ہو
+            if (!sock.authState.creds.registered && !pairingCodeRequested) {
+                pairingCodeRequested = true; // ✅ Flag لگا دیا - دوبارہ نہیں مانگے گا
                 
-                // چیک کریں کہ کیا پچھلا کوڈ بنے ہوئے 60 سیکنڈ (60000 ms) گزر چکے ہیں؟
-                if (currentTime - lastPairingTime >= 60000) {
-                    lastPairingTime = currentTime; // ٹائمر کو ری سیٹ کر دیا
-                    
-                    setTimeout(async () => {
-                        try {
-                            let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                            const pairingCode = await sock.requestPairingCode(formattedNumber);
-                            
-                            await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                                pairingCode: pairingCode
-                            });
-                            console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode} (Valid for next 60 seconds)`);
-                        } catch (err) { 
-                            console.error(`[${phoneNumberId}] Pairing Error:`, err.message); 
-                            lastPairingTime = 0; // اگر ایرر آئے تو اگلی باری فوراً ٹرائی کرے
-                        }
-                    }, 2000);
-                } else {
-                    // اگر 60 سیکنڈ نہیں گزرے، تو پرانا کوڈ ہی چلنے دو تاکہ یوزر آرام سے ٹائپ کر سکے
-                    console.log(`[${phoneNumberId}] ⏳ Waiting... User has ${Math.floor((60000 - (currentTime - lastPairingTime))/1000)} seconds left to enter the code.`);
-                }
+                // 3 سیکنڈ بعد pairing code request کریں تاکہ socket stable ہو جائے
+                setTimeout(async () => {
+                    try {
+                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                        console.log(`[${phoneNumberId}] 📞 Requesting Pairing Code for: ${formattedNumber}`);
+                        
+                        const pairingCode = await sock.requestPairingCode(formattedNumber);
+                        
+                        // Pairing code کو XXX-XXX format میں دکھائیں
+                        const formattedCode = pairingCode?.match(/.{1,4}/g)?.join('-') || pairingCode;
+                        
+                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                            pairingCode: formattedCode,
+                            status: 'waiting_for_scan_or_code'
+                        });
+                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${formattedCode}`);
+                    } catch (err) { 
+                        console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+                        pairingCodeRequested = false; // Error آئے تو اگلی QR پر دوبارہ try کرے
+                    }
+                }, 3000);
             }
         }
 
         if (connection === 'open') {
             console.log(`✅ [${phoneNumberId}] WA CONNECTED SECURELY`);
+            pairingCodeRequested = false; // Reset for future use
             await fbDelete(`bot_requests/${phoneNumberId}`); 
             
-            // ✅ Keeping both Device & User Nodes Connected
+            // ✅ FIX: waStatus field use کریں
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: sock.user.id.split(':')[0], 
                 lastActive: new Date().toISOString() 
             });
-            await fbPatch(`users/${phoneNumberId}`, { status: 'connected' });
+            await fbPatch(`users/${phoneNumberId}`, { waStatus: 'connected' });
             
             setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
         }
@@ -239,14 +252,15 @@ async function startDevice(phoneNumberId) {
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             activeSockets.delete(phoneNumberId);
+            pairingCodeRequested = false;
 
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 console.log(`❌ [${phoneNumberId}] LOGGED OUT BY USER.`);
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
                 
-                // ✅ Mark disconnected in both nodes if intentionally logged out
+                // ✅ FIX: waStatus field use کریں
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
-                await fbPatch(`users/${phoneNumberId}`, { status: 'disconnected' });
+                await fbPatch(`users/${phoneNumberId}`, { waStatus: 'disconnected' });
             } else {
                 console.log(`🔄 [${phoneNumberId}] CONNECTION DROPPED. RECONNECTING...`);
                 setTimeout(() => startDevice(phoneNumberId), 5000);
@@ -274,7 +288,8 @@ async function checkInactiveDevices() {
         if (activeSockets.has(deviceId) && activeSockets.get(deviceId)?.authState?.creds?.registered) {
             const currentTime = new Date().toISOString();
             await fbPatch(`devices/${deviceId}`, { lastActive: currentTime, status: 'connected' });
-            await fbPatch(`users/${deviceId}`, { status: 'connected' }); // Keep user node connected too
+            // ✅ FIX: waStatus field
+            await fbPatch(`users/${deviceId}`, { waStatus: 'connected' });
             continue; 
         }
 
@@ -283,9 +298,9 @@ async function checkInactiveDevices() {
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
                 console.log(`⚠️ [${deviceId}] No activity for 24h. Cleaning up...`);
                 
-                // ✅ Ensure both User & Device show disconnected after 24 hours of inactivity
+                // ✅ FIX: waStatus field
                 await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
-                await fbPatch(`users/${deviceId}`, { status: 'disconnected' });
+                await fbPatch(`users/${deviceId}`, { waStatus: 'disconnected' });
                 
                 if (activeSockets.has(deviceId)) activeSockets.delete(deviceId);
                 const sessionDir = `sessions_${deviceId}`;
@@ -294,7 +309,8 @@ async function checkInactiveDevices() {
                 // ✅ If it's within 24 hours, enforce 'connected' status in both places!
                 if (device.status !== 'connected') {
                     await fbPatch(`devices/${deviceId}`, { status: 'connected' });
-                    await fbPatch(`users/${deviceId}`, { status: 'connected' });
+                    // ✅ FIX: waStatus field
+                    await fbPatch(`users/${deviceId}`, { waStatus: 'connected' });
                 }
             }
         }
@@ -330,7 +346,6 @@ async function pollFirebase() {
                         console.log(`🗑️ [${id}] Old session cleared for a fresh QR/Pairing Code request.`);
                     }
 
-                    // نیا کنکشن بنانے کے لئے تھوڑا سا وقفہ دے دیا تاکہ پُرانی میموری کلیئر ہو سکے
                     setTimeout(() => startDevice(id), 2000);
                 }
             }
