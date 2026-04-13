@@ -76,7 +76,7 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP)
+// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP 24/7)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -87,18 +87,20 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop
+    // Auto-Reset Loop (24/7 Continues logic)
     console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
+    
+    await delay(1000); 
     return getNextPendingNumber();
 }
 
 // ==========================================
-// 🚀 BROADCAST WORKER (NON-STOP MODE)
+// 🚀 BROADCAST WORKER (NON-STOP 24/7 MODE)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     const runWorker = async () => {
@@ -135,6 +137,7 @@ async function startBroadcastWorker(sock, deviceId) {
             });
 
             console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
+            // Har message ke baad 20 minute ka wait karega
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
@@ -161,39 +164,48 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, // Terminal mein bhi show hoga
+        printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome')
+        // 🛠️ FIX FOR PAIRING ERROR: Changed browser config to prevent "Couldn't link device"
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
+    // 🛠️ FIX FOR PAIRING TIMING: Reduced delay to 3 seconds to avoid conflict with QR Code
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
+                    
+                    const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
-                        status: 'waiting_for_scan_or_code'
+                        status: 'waiting_for_scan_or_code',
+                        qrCode: currentData?.qrCode || null // QR Code ko mahfooz rakhega
                     });
                     console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 8000); 
+        }, 3000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
+        // 🔳 QR Code Link Generator
         if (qr) {
             console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
+            
+            const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qr,
-                status: 'waiting_for_scan_or_code'
+                qrCode: qrImageUrl, 
+                rawQr: qr, 
+                status: 'waiting_for_scan_or_code',
+                pairingCode: currentData?.pairingCode || null // Pairing Code ko mahfooz rakhega
             });
         }
 
