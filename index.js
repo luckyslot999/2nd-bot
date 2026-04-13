@@ -1,37 +1,38 @@
 require('dotenv').config();
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    Browsers
-} = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const http = require('http');
 
 // ==========================================
-// 🛡️ ANTI-CRASH
+// 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
 // ==========================================
-process.on('uncaughtException', (err) => console.error('🛡️ [ANTI-CRASH]', err.message));
-process.on('unhandledRejection', (reason) => console.error('🛡️ [UNHANDLED]', reason));
+process.on('uncaughtException', function (err) {
+    console.error('🛡️ [ANTI-CRASH] Caught exception: ', err.message);
+});
+process.on('unhandledRejection', (reason, p) => {
+    console.error('🛡️ [ANTI-CRASH] Unhandled Rejection at: Promise', p, 'reason:', reason);
+});
 
 const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
-const activeSockets = new Map();
+const activeSockets = new Map(); 
 
 // ==========================================
-// 🌐 HTTP SERVER (UPTIME)
+// 🌐 NATIVE HTTP SERVER (FOR UPTIME)
 // ==========================================
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Botzmine Bot Running 🚀');
-}).listen(PORT, () => console.log(`🌐 Server on port ${PORT}`));
+    res.end('Botzmine WhatsApp Bot is running... 🚀');
+});
+server.listen(PORT, () => {
+    console.log(`🌐 Web server is listening on port ${PORT}`);
+});
 
 // ==========================================
-// 🛠️ FIREBASE HELPERS
+// 🛠️ FIREBASE UTILITY FUNCTIONS
 // ==========================================
-const delay = (ms) => new Promise(r => setTimeout(r, ms));
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fbGet(path) {
     try {
@@ -47,101 +48,119 @@ async function fbPatch(path, data) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         });
-    } catch (e) { console.error("fbPatch Error:", e.message); }
+    } catch (e) { console.error("Firebase Patch Error:", e.message); }
 }
 
 async function fbDelete(path) {
     try {
         await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' });
-    } catch (e) { console.error("fbDelete Error:", e.message); }
+    } catch (e) { console.error("Firebase Delete Error:", e.message); }
 }
 
 // ==========================================
-// 📞 PHONE FORMATTER
+// 🔗 QR CODE URL GENERATOR
+// آپ کے بتائے ہوئے فارمیٹ کے مطابق
+// https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=...
 // ==========================================
-function formatPhone(raw) {
-    let num = raw.toString().replace(/\D/g, '');
-    if (num.startsWith('03') && num.length === 11) return '92' + num.substring(1);
+function generateQRImageUrl(qrData) {
+    const encodedData = encodeURIComponent(qrData);
+    return `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodedData}`;
+}
+
+// ==========================================
+// ⚙️ SETTINGS (NO LIMIT & 20 MIN DELAY)
+// ==========================================
+async function getSettings() {
+    const data = await fbGet('settings');
+    return { 
+        messageTemplate: data?.messageTemplate || "Hello, this is an automated message from Botzmine!", 
+        delayMinutes: 20 
+    };
+}
+
+function formatPhoneNumberForPairing(phoneNumber) {
+    let num = phoneNumber.toString().replace(/\D/g, ''); 
+    if (num.startsWith('03')) return '92' + num.substring(1);
     if (num.startsWith('3') && num.length === 10) return '92' + num;
-    if (num.startsWith('92') && num.length === 12) return num;
     return num;
 }
 
 // ==========================================
-// ⚙️ SETTINGS
-// ==========================================
-async function getSettings() {
-    const data = await fbGet('settings');
-    return {
-        messageTemplate: data?.messageTemplate || "Hello from Botzmine!",
-        delayMinutes: 20
-    };
-}
-
-// ==========================================
-// 🔄 NUMBER LOOP
+// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
     if (!numbers) return null;
+
     for (const phone in numbers) {
-        if (!numbers[phone].status || numbers[phone].status === 'pending') return phone;
+        const status = numbers[phone].status;
+        if (!status || status === 'pending') return phone;
     }
-    console.log('♻️ [AUTO-LOOP] Resetting all numbers...');
+
+    // Auto-Reset Loop
+    console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
-    for (const phone in numbers) updates[phone] = { status: 'pending', sentBy: null };
+    for (const phone in numbers) {
+        updates[phone] = { status: 'pending', sentBy: null };
+    }
     await fbPatch('numbers', updates);
     return getNextPendingNumber();
 }
 
 // ==========================================
-// 🚀 BROADCAST WORKER
+// 🚀 BROADCAST WORKER (NON-STOP MODE)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
-    const run = async () => {
+    const runWorker = async () => {
         try {
             if (!activeSockets.has(deviceId)) return;
-            const settings = await getSettings();
-            const rawPhone = await getNextPendingNumber();
-            if (!rawPhone) { setTimeout(run, 30000); return; }
 
+            const settings = await getSettings();
+            let rawPhone = await getNextPendingNumber();
+            
+            if (!rawPhone) {
+                setTimeout(runWorker, 30000); 
+                return;
+            }
+            
             const phone = rawPhone.replace(/\D/g, '');
             const jid = `${phone}@s.whatsapp.net`;
-
-            console.log(`[${deviceId}] ✍️ Sending to ${phone}...`);
+            
+            console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             await sock.sendPresenceUpdate('composing', jid);
             await delay(Math.random() * 5000 + 3000);
+            
             await sock.sendMessage(jid, { text: settings.messageTemplate });
-
+            
             const timestamp = new Date().toISOString();
-            const stats = await fbGet(`devices/${deviceId}`);
+            const today = timestamp.split('T')[0];
+            let stats = await fbGet(`devices/${deviceId}`);
 
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
-            await fbPatch(`devices/${deviceId}`, {
-                totalSent: (stats?.totalSent || 0) + 1,
-                date: timestamp.split('T')[0],
-                lastActive: timestamp,
-                status: 'connected'
-            });
-            await fbPatch(`users/${deviceId}`, { waStatus: 'connected', lastActive: timestamp });
 
-            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in ${settings.delayMinutes} mins.`);
-            setTimeout(run, settings.delayMinutes * 60 * 1000);
-        } catch (err) {
-            console.log(`[${deviceId}] ❌ Worker Error:`, err.message);
-            setTimeout(run, 20000);
+            // ✅ Message send ہونے پر lastMessageSent اور lastActive اپڈیٹ کریں
+            // تاکہ 24 گھنٹے کا timer reset ہو اور status connected رہے
+            await fbPatch(`devices/${deviceId}`, { 
+                totalSent: (stats?.totalSent || 0) + 1, 
+                date: today, 
+                lastActive: timestamp,
+                lastMessageSent: timestamp,  // ✅ نیا field: آخری message کا وقت
+                status: 'connected' 
+            });
+
+            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
+            setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
+            
+        } catch (error) {
+            console.log(`[${deviceId}] ❌ Error:`, error.message);
+            setTimeout(runWorker, 20000); 
         }
     };
-    run();
+    runWorker();
 }
 
 // ==========================================
-// 📱 DEVICE STARTER
-// ==========================================
-// ✅ اصل FIX:
-//   Pairing Code کے لیے: mobile: true + printQRInTerminal: false
-//   QR Code کے لیے:      mobile: false + printQRInTerminal: true
-//   دونوں ایک socket پر نہیں چل سکتے — الگ الگ socket بنتا ہے
+// 📱 DEVICE MANAGER (QR & PAIRING CODE)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeSockets.has(phoneNumberId) && typeof activeSockets.get(phoneNumberId) !== 'string') return;
@@ -149,222 +168,183 @@ async function startDevice(phoneNumberId) {
 
     const sessionDir = `sessions_${phoneNumberId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
-
-    // Firebase سے method چیک کریں: 'pairing' یا 'qr'
-    const request = await fbGet(`bot_requests/${phoneNumberId}`);
-    const usePairingCode = request?.method === 'pairing';
-
-    console.log(`[${phoneNumberId}] 🔌 Method: ${usePairingCode ? 'PAIRING CODE' : 'QR CODE'}`);
-
+    
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
-
-    // ✅ KEY FIX: pairing کے لیے mobile:true لازمی ہے
+    
     const sock = makeWASocket({
-        version,
-        auth: state,
+        version, 
+        auth: state, 
+        printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
-        keepAliveIntervalMs: 30000,
-        markOnlineOnConnect: true,
         browser: Browsers.ubuntu('Chrome'),
-        printQRInTerminal: !usePairingCode,
-        mobile: usePairingCode   // ← یہی pairing code کا راز ہے
+        // ✅ کنیکشن مضبوط رکھنے کے لیے keep-alive settings
+        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,
+        retryRequestDelayMs: 2000,
+        maxMsgRetryCount: 5
     });
 
     activeSockets.set(phoneNumberId, sock);
-    sock.ev.on('creds.update', saveCreds);
 
-    let pairingDone = false;
+    // ✅ Pairing Code Request (8 سیکنڈ بعد اگر registered نہ ہو)
+    if (!sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
+                    let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                    const pairingCode = await sock.requestPairingCode(formattedNumber);
+
+                    // ✅ Pairing code Firebase میں save کریں
+                    await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                        pairingCode: pairingCode,
+                        status: 'waiting_for_scan_or_code'
+                    });
+                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
+                }
+            } catch (err) { console.error("Pairing Error:", err.message); }
+        }, 8000); 
+    }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-
-        // ─── QR MODE ───────────────────────────────────────────────
-        if (qr && !usePairingCode) {
-            const link = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            console.log(`[${phoneNumberId}] 📷 QR Ready`);
-            await fbPatch(`bot_requests/${phoneNumberId}`, {
-                qrCode: link,
-                pairingCode: null,
+        
+        // ✅ QR کوڈ جنریٹ ہو تو اسے image URL میں convert کر کے Firebase میں save کریں
+        if (qr) {
+            const qrImageUrl = generateQRImageUrl(qr);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated -> ${qrImageUrl}`);
+            await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                qrCode: qrImageUrl,       // ✅ QR image URL (api.qrserver.com)
+                qrRaw: qr,                // ✅ Raw QR data بھی save کریں (backup)
                 status: 'waiting_for_scan_or_code'
             });
         }
 
-        // ─── PAIRING CODE MODE ─────────────────────────────────────
-        // ✅ FIX: 'connecting' state پر request — QR کا انتظار نہیں
-        if (usePairingCode && !pairingDone && !sock.authState.creds.registered) {
-            if (connection === 'connecting' || connection === 'open') return; // open پر skip
-            if (!connection || connection === 'connecting') {
-                pairingDone = true;
-                await delay(3000);
-                try {
-                    const formatted = formatPhone(phoneNumberId);
-                    console.log(`[${phoneNumberId}] 📞 Requesting code for: ${formatted}`);
-                    const code = await sock.requestPairingCode(formatted);
-                    const display = code?.match(/.{1,4}/g)?.join('-') || code;
-                    console.log(`[${phoneNumberId}] 🔑 CODE: ${display}`);
-                    await fbPatch(`bot_requests/${phoneNumberId}`, {
-                        pairingCode: display,
-                        qrCode: null,
-                        status: 'waiting_for_scan_or_code'
-                    });
-                } catch (err) {
-                    console.error(`[${phoneNumberId}] ❌ Pairing error:`, err.message);
-                    pairingDone = false;
-                    // 8 سیکنڈ بعد retry
-                    setTimeout(async () => {
-                        if (!activeSockets.has(phoneNumberId) || pairingDone) return;
-                        pairingDone = true;
-                        try {
-                            const formatted = formatPhone(phoneNumberId);
-                            const code = await sock.requestPairingCode(formatted);
-                            const display = code?.match(/.{1,4}/g)?.join('-') || code;
-                            await fbPatch(`bot_requests/${phoneNumberId}`, {
-                                pairingCode: display,
-                                status: 'waiting_for_scan_or_code'
-                            });
-                            console.log(`[${phoneNumberId}] 🔑 CODE (retry): ${display}`);
-                        } catch (e) {
-                            console.error(`[${phoneNumberId}] Retry failed:`, e.message);
-                            pairingDone = false;
-                        }
-                    }, 8000);
-                }
-            }
-        }
-
-        // ─── CONNECTED ─────────────────────────────────────────────
         if (connection === 'open') {
-            console.log(`✅ [${phoneNumberId}] CONNECTED!`);
-            pairingDone = false;
+            console.log(`✅ [${phoneNumberId}] CONNECTED`);
             await fbDelete(`bot_requests/${phoneNumberId}`);
-            await fbPatch(`devices/${phoneNumberId}`, {
-                status: 'connected',
-                phone: sock.user?.id?.split(':')[0] || phoneNumberId,
-                lastActive: new Date().toISOString()
+            const timestamp = new Date().toISOString();
+            await fbPatch(`devices/${phoneNumberId}`, { 
+                status: 'connected', 
+                phone: sock.user.id.split(':')[0], 
+                lastActive: timestamp,
+                lastMessageSent: timestamp, // ✅ کنیکٹ ہوتے ہی set کریں
+                connectedAt: timestamp
             });
-            await fbPatch(`users/${phoneNumberId}`, { waStatus: 'connected' });
             setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
         }
-
-        // ─── DISCONNECTED ──────────────────────────────────────────
+        
         if (connection === 'close') {
-            const code = lastDisconnect?.error?.output?.statusCode;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
             activeSockets.delete(phoneNumberId);
-            pairingDone = false;
 
-            const isLoggedOut = code === DisconnectReason.loggedOut || code === 401;
-
-            if (isLoggedOut) {
-                console.log(`❌ [${phoneNumberId}] LOGGED OUT`);
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                // ✅ صرف لاگ آؤٹ پر ہی disconnect کریں
+                console.log(`❌ [${phoneNumberId}] LOGGED OUT - Cleaning session...`);
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
-                await fbPatch(`users/${phoneNumberId}`, { waStatus: 'disconnected' });
             } else {
-                console.log(`🔄 [${phoneNumberId}] Reconnecting in 5s...`);
+                // ✅ باقی تمام errors پر reconnect کریں، status connected رکھیں
+                console.log(`🔄 [${phoneNumberId}] Connection dropped, reconnecting in 5s...`);
+                // Status connected رکھیں جب تک reconnect ہو رہا ہے
+                await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
     });
+    
+    sock.ev.on('creds.update', saveCreds);
 }
 
 // ==========================================
-// 🕒 HEARTBEAT & 24H CHECK
+// 🕒 24-HOUR ACTIVITY CHECKER (FIXED)
+// ✅ اگر 24 گھنٹے میں ایک بھی message send ہو تو disconnect نہ کریں
 // ==========================================
 async function checkInactiveDevices() {
     const devices = await fbGet('devices');
     if (!devices) return;
 
-    const now = Date.now();
-    const H24 = 24 * 60 * 60 * 1000;
+    const now = new Date().getTime();
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
-    for (const id in devices) {
-        const dev = devices[id];
+    for (const deviceId in devices) {
+        const device = devices[deviceId];
 
-        if (activeSockets.has(id) && activeSockets.get(id)?.authState?.creds?.registered) {
-            const ts = new Date().toISOString();
-            await fbPatch(`devices/${id}`, { lastActive: ts, status: 'connected' });
-            await fbPatch(`users/${id}`, { waStatus: 'connected' });
-            continue;
-        }
+        // صرف ان devices کو check کریں جو connected یا reconnecting ہیں
+        if (device.status === 'disconnected') continue;
 
-        if (dev.status !== 'disconnected' && dev.lastActive) {
-            const last = new Date(dev.lastActive).getTime();
-            if (now - last > H24) {
-                console.log(`⚠️ [${id}] 24h inactive.`);
-                await fbPatch(`devices/${id}`, { status: 'disconnected' });
-                await fbPatch(`users/${id}`, { waStatus: 'disconnected' });
-                activeSockets.delete(id);
-                const dir = `sessions_${id}`;
-                if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-            } else if (dev.status !== 'connected') {
-                await fbPatch(`devices/${id}`, { status: 'connected' });
-                await fbPatch(`users/${id}`, { waStatus: 'connected' });
+        // ✅ lastMessageSent چیک کریں - اگر 24 گھنٹے میں message گیا تو connected رکھیں
+        const lastMessageTime = device.lastMessageSent 
+            ? new Date(device.lastMessageSent).getTime() 
+            : null;
+
+        const lastActiveTime = device.lastActive 
+            ? new Date(device.lastActive).getTime() 
+            : null;
+
+        // ✅ دونوں میں سے جو بھی latest ہو وہ لیں
+        const mostRecentActivity = Math.max(
+            lastMessageTime || 0, 
+            lastActiveTime || 0
+        );
+
+        if (mostRecentActivity > 0 && (now - mostRecentActivity) > TWENTY_FOUR_HOURS) {
+            // ✅ پورے 24 گھنٹے کوئی message نہیں گیا - تب disconnect کریں
+            console.log(`⚠️ [${deviceId}] No message in 24h. Disconnecting...`);
+            await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
+            if (activeSockets.has(deviceId)) {
+                try { activeSockets.get(deviceId)?.end?.(); } catch(e) {}
+                activeSockets.delete(deviceId);
+            }
+            const sessionDir = `sessions_${deviceId}`;
+            if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+        } else if (mostRecentActivity > 0) {
+            // ✅ 24 گھنٹے میں activity ہے - connected رکھیں
+            console.log(`✅ [${deviceId}] Active within 24h. Keeping connected.`);
+            // اگر کسی وجہ سے socket نہیں ہے تو restart کریں
+            if (!activeSockets.has(deviceId) && device.status === 'connected') {
+                console.log(`🔄 [${deviceId}] Restarting missing socket...`);
+                startDevice(deviceId);
             }
         }
     }
 }
 
 // ==========================================
-// 🔄 MAIN POLL LOOP
+// 🔄 SYSTEM POLLING
 // ==========================================
 async function pollFirebase() {
     setInterval(async () => {
         const requests = await fbGet('bot_requests');
         if (requests) {
             for (const id in requests) {
-                const req = requests[id];
-                if (req.action &&
-                    req.status !== 'processing' &&
-                    req.status !== 'waiting_for_scan_or_code') {
-
+                if (requests[id].action && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
                     await fbPatch(`bot_requests/${id}`, { status: 'processing' });
-
-                    // پرانا socket بند کریں
-                    if (activeSockets.has(id)) {
-                        try {
-                            const old = activeSockets.get(id);
-                            if (typeof old !== 'string') {
-                                old.ev.removeAllListeners();
-                                old.ws?.close();
-                            }
-                        } catch (e) {}
-                        activeSockets.delete(id);
-                    }
-
-                    // پرانا session صاف کریں
-                    const dir = `sessions_${id}`;
-                    if (fs.existsSync(dir)) {
-                        fs.rmSync(dir, { recursive: true, force: true });
-                        console.log(`🗑️ [${id}] Session cleared.`);
-                    }
-
-                    setTimeout(() => startDevice(id), 2000);
+                    startDevice(id);
                 }
             }
         }
 
-        // موجودہ active devices restart کریں اگر socket نہیں
         const devices = await fbGet('devices');
         if (devices) {
             for (const id in devices) {
-                if ((devices[id].status === 'pending' || devices[id].status === 'connected') &&
-                    !activeSockets.has(id)) {
+                if ((devices[id].status === 'pending' || devices[id].status === 'connected') && !activeSockets.has(id)) {
                     startDevice(id);
                 }
             }
         }
     }, 10000);
 
-    setInterval(() => checkInactiveDevices(), 60 * 60 * 1000);
+    // ✅ 24-hour activity check ہر 10 منٹ بعد
+    setInterval(() => checkInactiveDevices(), 10 * 60 * 1000); 
 }
 
 // ==========================================
-// 🚀 START ENGINE
+// 🚀 START
 // ==========================================
 if (FIREBASE_URL) {
     pollFirebase();
-    console.log("🚀 Botzmine Engine Started! (24/7 Active)");
+    console.log("🚀 Botzmine Engine Started!");
 } else {
-    console.error("❌ FIREBASE_URL missing in .env!");
+    console.error("❌ FIREBASE_URL missing!");
 }
