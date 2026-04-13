@@ -3,13 +3,12 @@ name: W-Broadcaster-Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */5 * * *' 
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
+    timeout-minutes: 350 # GitHub limit is 360 mins (6 hours). This will prevent crash errors.
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -19,33 +18,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Cache Node Modules
-        uses: actions/cache@v4
-        with:
-          path: node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('package.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-
       - name: Install Dependencies
         run: npm install
-
-      - name: Restore WhatsApp Sessions
-        uses: actions/cache/restore@v4
-        with:
-          path: sessions_*
-          key: whatsapp-sessions-${{ github.run_id }}
-          restore-keys: |
-            whatsapp-sessions-
 
       - name: Start Multi-Device Broadcaster
         env:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
         run: npm start
-
-      - name: Save WhatsApp Sessions
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: sessions_*
-          key: whatsapp-sessions-${{ github.run_id }}
