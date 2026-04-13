@@ -76,7 +76,7 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP 24/7)
+// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -87,20 +87,18 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop (24/7 Continues logic)
+    // Auto-Reset Loop
     console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    
-    await delay(1000); 
     return getNextPendingNumber();
 }
 
 // ==========================================
-// 🚀 BROADCAST WORKER (NON-STOP 24/7 MODE)
+// 🚀 BROADCAST WORKER (NON-STOP MODE)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     const runWorker = async () => {
@@ -137,7 +135,6 @@ async function startBroadcastWorker(sock, deviceId) {
             });
 
             console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
-            // Har message ke baad 20 minute ka wait karega
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
@@ -164,48 +161,39 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, 
+        printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
-        // 🛠️ FIX FOR PAIRING ERROR: Changed browser config to prevent "Couldn't link device"
-        browser: ['Ubuntu', 'Chrome', '20.0.04']
+        browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // 🛠️ FIX FOR PAIRING TIMING: Reduced delay to 3 seconds to avoid conflict with QR Code
+    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
-                    
-                    const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
-                        status: 'waiting_for_scan_or_code',
-                        qrCode: currentData?.qrCode || null // QR Code ko mahfooz rakhega
+                        status: 'waiting_for_scan_or_code'
                     });
                     console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 3000); 
+        }, 8000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 QR Code Link Generator
+        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
         if (qr) {
             console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
-            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            
-            const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qrImageUrl, 
-                rawQr: qr, 
-                status: 'waiting_for_scan_or_code',
-                pairingCode: currentData?.pairingCode || null // Pairing Code ko mahfooz rakhega
+                qrCode: qr,
+                status: 'waiting_for_scan_or_code'
             });
         }
 
