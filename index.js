@@ -194,11 +194,15 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // QR CODE FIX: Save directly to Firebase Database
+        // 🔳 QR CODE FIX: Generating the api.qrserver.com image link
         if (qr) {
-            console.log(`[${phoneNumberId}] 🔳 QR Code Generated, saving to database...`);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated, saving Image Link to database...`);
+            
+            // Encode the raw QR string into the URL format you provided
+            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
+            
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qr,
+                qrCode: qrImageUrl, // Now saving the Full Image Link
                 status: 'waiting_for_scan_or_code'
             });
         }
