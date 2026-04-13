@@ -68,19 +68,11 @@ async function getSettings() {
     };
 }
 
-// 🛠️ FIX: انتہائی مضبوط اور پرفیکٹ نمبر فارمیٹر (آپ کے بتائے ہوئے فارمیٹ 923499085004 کے مطابق)
 function formatPhoneNumberForPairing(phoneNumber) {
-    let num = phoneNumber.toString().replace(/[^0-9]/g, ''); // صرف نمبرز رکھے گا، باقی سب ختم
-    
-    // اگر نمبر پہلے سے ہی 92 سے شروع ہو رہا ہے (جیسے 923499085004) تو اس کو بالکل نہیں چھیڑے گا
+    let num = phoneNumber.toString().replace(/[^0-9]/g, ''); 
     if (num.startsWith('92') && num.length === 12) return num; 
-    
-    // اگر 03 سے شروع ہو رہا ہے تو 0 ہٹا کر 92 لگائے گا
     if (num.startsWith('03')) return '92' + num.substring(1);
-    
-    // اگر صرف 3 سے شروع ہو رہا ہے اور 10 ہندسوں کا ہے
     if (num.startsWith('3') && num.length === 10) return '92' + num;
-    
     return num;
 }
 
@@ -96,7 +88,6 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop
     console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
     for (const phone in numbers) {
@@ -168,18 +159,17 @@ async function startDevice(phoneNumberId) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
-    // بالکل آپ کا اوریجنل براؤزر اور ساکٹ
     const sock = makeWASocket({
         version, 
         auth: state, 
         printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome')
+        // 🛠️ FIX FOR 2024 PAIRING: Changed to Windows Chrome for max trust
+        browser: Browsers.windows('Chrome') 
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // آپ کا اوریجنل 8 سیکنڈ کا لاجک۔ اب یہ صحیح فارمیٹ والا نمبر واٹس ایپ کو بھیجے گا۔
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -187,7 +177,6 @@ async function startDevice(phoneNumberId) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
                     
-                    // fbPatch پرانا ڈیٹا ڈیلیٹ کیے بغیر نیا ایڈ کرتا ہے
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
                         status: 'waiting_for_scan_or_code'
@@ -201,12 +190,10 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 QR Code Link Update
         if (qr) {
-            console.log(`[${phoneNumberId}] 🔳 QR Code Generated/Refreshed`);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             
-            // fbPatch استعمال کیا ہے تاکہ یہ Pairing Code کو غائب نہ کرے
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
                 qrCode: qrImageUrl,
                 status: 'waiting_for_scan_or_code'
@@ -268,14 +255,28 @@ async function checkInactiveDevices() {
 }
 
 // ==========================================
-// 🔄 SYSTEM POLLING
+// 🔄 SYSTEM POLLING (FIXED LOGOUT BUG)
 // ==========================================
 async function pollFirebase() {
     setInterval(async () => {
         const requests = await fbGet('bot_requests');
         if (requests) {
             for (const id in requests) {
-                if (requests[id].action && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
+                // 🚨 FIX: اگر یوزر نے ڈس کنیکٹ کا بٹن دبایا ہے تو پرانا سیشن ڈیلیٹ کرو
+                if (requests[id].action === 'logout') {
+                    console.log(`🧹 [${id}] Clearing Corrupted Session...`);
+                    if (activeSockets.has(id)) {
+                        try { activeSockets.get(id).logout(); } catch(e){}
+                        activeSockets.delete(id);
+                    }
+                    const sessionDir = `sessions_${id}`;
+                    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+                    
+                    await fbDelete(`bot_requests/${id}`);
+                    await fbPatch(`devices/${id}`, { status: 'disconnected' });
+                }
+                // اور اگر جنریٹ کی ریکویسٹ ہے تو ڈیوائس سٹارٹ کرو
+                else if (requests[id].action === 'generate_qr' && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
                     await fbPatch(`bot_requests/${id}`, { status: 'processing' });
                     startDevice(id);
                 }
