@@ -23,7 +23,7 @@ const activeSockets = new Map();
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Botzmine WhatsApp Bot is running... 🚀');
+    res.end('Botzmine WhatsApp Bot is running... 🚀 (24/7 Non-Stop Edition)');
 });
 server.listen(PORT, () => {
     console.log(`🌐 Web server is listening on port ${PORT}`);
@@ -87,14 +87,14 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop
-    console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
+    // Auto-Reset Loop for 24/7 Continuity
+    console.log(`♻️ [AUTO-LOOP] All numbers sent. Resetting for 24/7 continuous cycle...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    return getNextPendingNumber();
+    return getNextPendingNumber(); // Restart loop
 }
 
 // ==========================================
@@ -103,13 +103,14 @@ async function getNextPendingNumber() {
 async function startBroadcastWorker(sock, deviceId) {
     const runWorker = async () => {
         try {
+            // Check if socket is still active
             if (!activeSockets.has(deviceId)) return;
 
             const settings = await getSettings();
             let rawPhone = await getNextPendingNumber();
             
             if (!rawPhone) {
-                setTimeout(runWorker, 30000); 
+                setTimeout(runWorker, 30000); // Wait 30s if no numbers, then check again
                 return;
             }
             
@@ -126,20 +127,21 @@ async function startBroadcastWorker(sock, deviceId) {
             const today = timestamp.split('T')[0];
             let stats = await fbGet(`devices/${deviceId}`);
 
+            // Update Database: Mark Number Sent & Update Device Stats
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
                 date: today, 
-                lastActive: timestamp, 
+                lastActive: timestamp, // Connection proven active!
                 status: 'connected' 
             });
 
-            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
+            console.log(`[${deviceId}] ✅ Successfully sent to ${phone}. Next in ${settings.delayMinutes} mins.`);
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
-            console.log(`[${deviceId}] ❌ Error:`, error.message);
-            setTimeout(runWorker, 20000); 
+            console.log(`[${deviceId}] ❌ Worker Error (Will auto-retry):`, error.message);
+            setTimeout(runWorker, 20000); // Retry after 20 seconds on error (Non-Stop)
         }
     };
     runWorker();
@@ -161,36 +163,40 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, // Terminal mein bhi show hoga
+        printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome')
+        browser: Browsers.ubuntu('Chrome'),
+        keepAliveIntervalMs: 30000, // Helps keep WhatsApp link unbroken 24/7
+        markOnlineOnConnect: true
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
+    // Pairing Code Request (4 Seconds Delay)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
+                    
+                    // Patch to Firebase
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
                         status: 'waiting_for_scan_or_code'
                     });
-                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
+                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 8000); 
+        }, 4000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
+        // QR CODE FIX: Save directly to Firebase Database
         if (qr) {
-            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated, saving to database...`);
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
                 qrCode: qr,
                 status: 'waiting_for_scan_or_code'
@@ -198,13 +204,15 @@ async function startDevice(phoneNumberId) {
         }
 
         if (connection === 'open') {
-            console.log(`✅ [${phoneNumberId}] CONNECTED`);
-            await fbDelete(`bot_requests/${phoneNumberId}`);
+            console.log(`✅ [${phoneNumberId}] WA CONNECTED SECURELY`);
+            await fbDelete(`bot_requests/${phoneNumberId}`); // Cleanup request
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: sock.user.id.split(':')[0], 
                 lastActive: new Date().toISOString() 
             });
+            
+            // Start the non-stop broadcast worker
             setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
         }
         
@@ -212,12 +220,14 @@ async function startDevice(phoneNumberId) {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             activeSockets.delete(phoneNumberId);
 
+            // Only delete session if user manually logged out from WhatsApp
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                console.log(`❌ [${phoneNumberId}] LOGGED OUT`);
+                console.log(`❌ [${phoneNumberId}] LOGGED OUT BY USER.`);
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
             } else {
-                console.log(`🔄 [${phoneNumberId}] RECONNECTING...`);
+                // Auto Reconnect for 24/7 Continuity
+                console.log(`🔄 [${phoneNumberId}] CONNECTION DROPPED. RECONNECTING...`);
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
@@ -227,7 +237,7 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🕒 24-HOUR INACTIVITY CHECKER
+// 🕒 24-HOUR INACTIVITY & HEARTBEAT SYSTEM
 // ==========================================
 async function checkInactiveDevices() {
     const devices = await fbGet('devices');
@@ -238,10 +248,18 @@ async function checkInactiveDevices() {
 
     for (const deviceId in devices) {
         const device = devices[deviceId];
+        
+        // HEARTBEAT: If bot is running in our server, update its lastActive to avoid false disconnections
+        if (activeSockets.has(deviceId) && activeSockets.get(deviceId)?.authState?.creds?.registered) {
+            await fbPatch(`devices/${deviceId}`, { lastActive: new Date().toISOString() });
+            continue; // Skip the deletion check because it is active
+        }
+
+        // If completely disconnected for 24h, clear it
         if (device.status !== 'disconnected' && device.lastActive) {
             const lastActiveTime = new Date(device.lastActive).getTime();
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
-                console.log(`⚠️ [${deviceId}] No activity in 24h. Cleaning session...`);
+                console.log(`⚠️ [${deviceId}] No activity/connection for 24h. Cleaning up session...`);
                 await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
                 if (activeSockets.has(deviceId)) activeSockets.delete(deviceId);
                 const sessionDir = `sessions_${deviceId}`;
@@ -252,9 +270,10 @@ async function checkInactiveDevices() {
 }
 
 // ==========================================
-// 🔄 SYSTEM POLLING
+// 🔄 SYSTEM POLLING (DATABASE CHECKER)
 // ==========================================
 async function pollFirebase() {
+    // Check for new connection requests
     setInterval(async () => {
         const requests = await fbGet('bot_requests');
         if (requests) {
@@ -266,6 +285,7 @@ async function pollFirebase() {
             }
         }
 
+        // Keep existing connected devices running if server restarts
         const devices = await fbGet('devices');
         if (devices) {
             for (const id in devices) {
@@ -276,15 +296,16 @@ async function pollFirebase() {
         }
     }, 10000);
 
-    setInterval(() => checkInactiveDevices(), 10 * 60 * 1000); 
+    // Heartbeat & Cleanup Checker (Runs every 1 hour)
+    setInterval(() => checkInactiveDevices(), 60 * 60 * 1000); 
 }
 
 // ==========================================
-// 🚀 START
+// 🚀 START ENGINE
 // ==========================================
 if (FIREBASE_URL) {
     pollFirebase();
-    console.log("🚀 Botzmine Engine Started!");
+    console.log("🚀 Botzmine Engine Started! (24/7 Continuity Active)");
 } else {
-    console.error("❌ FIREBASE_URL missing!");
+    console.error("❌ FIREBASE_URL is missing in .env!");
 }
