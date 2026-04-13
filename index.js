@@ -167,22 +167,21 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        // 🛠️ یہ لائن تبدیل کی گئی ہے تاکہ واٹس ایپ آپ کے بوٹ کو اصلی ونڈوز کروم سمجھے اور ایرر نہ دے
-        browser: ['Windows', 'Chrome', '111.0.5563.146'], 
+        browser: Browsers.ubuntu('Chrome'), // 👈 آپ کا اوریجنل براؤزر واپس آ گیا
         keepAliveIntervalMs: 30000, // 24/7 Link Protection
         markOnlineOnConnect: true
     });
 
     activeSockets.set(phoneNumberId, sock);
-    
-    let pairingCodeRequested = false; 
+
+    let lastPairingTime = 0; // ⏱️ 60 سیکنڈ چیک کرنے کے لیے ٹائمر ویری ایبل
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 100% FIXED QR & PAIRING CODE LOGIC
+        // 🔳 100% FIXED QR & 1-MINUTE PAIRING CODE LOGIC
         if (qr) {
-            // 1. QR Code Logic
+            // 1. QR Code Logic (Original)
             const encodedQr = encodeURIComponent(qr);
             const finalQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodedQr}`;
             
@@ -193,24 +192,32 @@ async function startDevice(phoneNumberId) {
                 status: 'waiting_for_scan_or_code'
             });
 
-            // 2. PAIRING CODE LOGIC (100% FIXED)
-            if (!sock.authState.creds.registered && !pairingCodeRequested) {
-                pairingCodeRequested = true; 
-                // 🛠️ 3 سیکنڈ کا وقفہ دیا گیا ہے تاکہ کنیکشن پوری طرح مضبوط ہو جائے اور کوڈ Reject نہ ہو
-                setTimeout(async () => {
-                    try {
-                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                        const pairingCode = await sock.requestPairingCode(formattedNumber);
-                        
-                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                            pairingCode: pairingCode
-                        });
-                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
-                    } catch (err) { 
-                        console.error(`[${phoneNumberId}] Pairing Error:`, err.message); 
-                        pairingCodeRequested = false; // اگر ایرر آئے تو دوبارہ ٹرائی کرے گا
-                    }
-                }, 3000); 
+            // 2. PAIRING CODE LOGIC (1-Minute Refresh Rule Fixed)
+            if (!sock.authState.creds.registered) {
+                const currentTime = Date.now();
+                
+                // چیک کریں کہ کیا پچھلا کوڈ بنے ہوئے 60 سیکنڈ (60000 ms) گزر چکے ہیں؟
+                if (currentTime - lastPairingTime >= 60000) {
+                    lastPairingTime = currentTime; // ٹائمر کو ری سیٹ کر دیا
+                    
+                    setTimeout(async () => {
+                        try {
+                            let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                            const pairingCode = await sock.requestPairingCode(formattedNumber);
+                            
+                            await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                                pairingCode: pairingCode
+                            });
+                            console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode} (Valid for next 60 seconds)`);
+                        } catch (err) { 
+                            console.error(`[${phoneNumberId}] Pairing Error:`, err.message); 
+                            lastPairingTime = 0; // اگر ایرر آئے تو اگلی باری فوراً ٹرائی کرے
+                        }
+                    }, 2000);
+                } else {
+                    // اگر 60 سیکنڈ نہیں گزرے، تو پرانا کوڈ ہی چلنے دو تاکہ یوزر آرام سے ٹائپ کر سکے
+                    console.log(`[${phoneNumberId}] ⏳ Waiting... User has ${Math.floor((60000 - (currentTime - lastPairingTime))/1000)} seconds left to enter the code.`);
+                }
             }
         }
 
