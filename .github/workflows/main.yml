@@ -1,19 +1,22 @@
 services:
   - type: web
-    name: whatsapp-baileys-bot
+    name: botzmine-whatsapp-bot
     env: node
-    plan: starter # Starter plan is required for Persistent Disks on Render
+    region: singapore
+    plan: free
     buildCommand: npm install
-    startCommand: npm start
-    healthCheckPath: /status?phoneNumber=system_ping
-    disk:
-      name: bot-auth-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1
+    startCommand: node index.js
+    autoDeploy: true
+
     envVars:
+      - key: FIREBASE_URL
+        sync: false
       - key: PORT
         value: 3000
-      - key: FIREBASE_DATABASE_URL
-        sync: false # Set this in the Render Dashboard (e.g. https://your-project.firebaseio.com)
-      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
-        sync: false # Set this in the Render Dashboard (Base64 encoded Firebase JSON)
+      - key: NODE_ENV
+        value: production
+
+    disk:
+      name: sessions-storage
+      mountPath: /opt/render/project/src
+      sizeGB: 1
