@@ -129,7 +129,7 @@ async function startBroadcastWorker(sock, deviceId) {
             // Update Database: Mark Number Sent & Update Device Stats
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
             
-            // ✅ [UPDATE] Updating Both Device and User Nodes to 'connected'
+            // ✅ Updating Both Device and User Nodes to 'connected'
             await fbPatch(`devices/${deviceId}`, { 
                 totalSent: (stats?.totalSent || 0) + 1, 
                 date: today, 
@@ -174,49 +174,46 @@ async function startDevice(phoneNumberId) {
 
     activeSockets.set(phoneNumberId, sock);
 
-    // 🔑 Pairing Code Generator (Original & Working)
-    if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
-                if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
-                    let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                    const pairingCode = await sock.requestPairingCode(formattedNumber);
-                    
-                    await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                        pairingCode: pairingCode,
-                        status: 'waiting_for_scan_or_code'
-                    });
-                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
-                }
-            } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 4000); 
-    }
-
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 100% FIXED QR CODE LINK GENERATOR (GUARANTEED)
+        // 🔳 100% FIXED QR & PAIRING CODE LOGIC
         if (qr) {
-            // سب سے پہلے کچے کوڈ (2@G0rlx...) کو انکوڈ کر رہے ہیں تاکہ لنک ٹوٹے نہ
+            // 1. QR Code Logic
             const encodedQr = encodeURIComponent(qr);
-            
-            // یہاں ایگزیکٹ (Exact) وہی لنک بن رہا ہے جو آپ نے مجھے دیا ہے
             const finalQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodedQr}`;
             
             console.log(`[${phoneNumberId}] 🔗 Sending FULL URL to Firebase: ${finalQrLink}`);
             
-            // فائر بیس میں اب یہ پورا https والا کلک ایبل لنک سیو ہوگا
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
                 qrCode: finalQrLink, 
                 status: 'waiting_for_scan_or_code'
             });
+
+            // 2. PAIRING CODE LOGIC (FIXED) 
+            // اسے اب QR کے ساتھ جوڑ دیا گیا ہے تاکہ WhatsApp اسے 100% Valid مانے اور نوٹیفکیشن بھیجے
+            if (!sock.authState.creds.registered) {
+                setTimeout(async () => {
+                    try {
+                        let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                        const pairingCode = await sock.requestPairingCode(formattedNumber);
+                        
+                        await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                            pairingCode: pairingCode
+                        });
+                        console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
+                    } catch (err) { 
+                        console.error(`[${phoneNumberId}] Pairing Error:`, err.message); 
+                    }
+                }, 2000); // 2 سیکنڈ کا وقفہ تاکہ سرور پوری طرح ریڈی ہو جائے
+            }
         }
 
         if (connection === 'open') {
             console.log(`✅ [${phoneNumberId}] WA CONNECTED SECURELY`);
             await fbDelete(`bot_requests/${phoneNumberId}`); 
             
-            // ✅ [UPDATE] Keeping both Device & User Nodes Connected
+            // ✅ Keeping both Device & User Nodes Connected
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
                 phone: sock.user.id.split(':')[0], 
@@ -235,7 +232,7 @@ async function startDevice(phoneNumberId) {
                 console.log(`❌ [${phoneNumberId}] LOGGED OUT BY USER.`);
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
                 
-                // ✅ [UPDATE] Mark disconnected in both nodes if intentionally logged out
+                // ✅ Mark disconnected in both nodes if intentionally logged out
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
                 await fbPatch(`users/${phoneNumberId}`, { status: 'disconnected' });
             } else {
@@ -274,7 +271,7 @@ async function checkInactiveDevices() {
             if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
                 console.log(`⚠️ [${deviceId}] No activity for 24h. Cleaning up...`);
                 
-                // ✅ [UPDATE] Ensure both User & Device show disconnected after 24 hours of inactivity
+                // ✅ Ensure both User & Device show disconnected after 24 hours of inactivity
                 await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
                 await fbPatch(`users/${deviceId}`, { status: 'disconnected' });
                 
@@ -282,7 +279,7 @@ async function checkInactiveDevices() {
                 const sessionDir = `sessions_${deviceId}`;
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
             } else {
-                // ✅ [UPDATE] If it's within 24 hours, enforce 'connected' status in both places!
+                // ✅ If it's within 24 hours, enforce 'connected' status in both places!
                 if (device.status !== 'connected') {
                     await fbPatch(`devices/${deviceId}`, { status: 'connected' });
                     await fbPatch(`users/${deviceId}`, { status: 'connected' });
@@ -303,8 +300,7 @@ async function pollFirebase() {
                 if (requests[id].action && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
                     await fbPatch(`bot_requests/${id}`, { status: 'processing' });
                     
-                    // 🧹 [NEW UPDATE] - CLEANUP OLD SESSIONS ON NEW REQUEST
-                    // اگر یوزر دوبارہ ریکویسٹ کر رہا ہے تو پُرانا سیشن ڈیلیٹ کریں تاکہ نیا اوریجنل QR/Code بنے
+                    // 🧹 CLEANUP OLD SESSIONS ON NEW REQUEST
                     if (activeSockets.has(id)) {
                         try {
                             const oldSock = activeSockets.get(id);
@@ -322,7 +318,8 @@ async function pollFirebase() {
                         console.log(`🗑️ [${id}] Old session cleared for a fresh QR/Pairing Code request.`);
                     }
 
-                    startDevice(id);
+                    // نیا کنکشن بنانے کے لئے تھوڑا سا وقفہ دے دیا تاکہ پُرانی میموری کلیئر ہو سکے
+                    setTimeout(() => startDevice(id), 2000);
                 }
             }
         }
