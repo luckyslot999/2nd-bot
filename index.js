@@ -159,51 +159,44 @@ async function startDevice(phoneNumberId) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
+    // بالکل آپ کا اوریجنل ساکٹ بغیر کسی چھیڑ چھاڑ کے
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true,
+        printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        // 🛡️ یہ براؤزر سیٹنگ پیرنگ کوڈ کے "Couldn't link device" ایرر کا 100٪ فکس ہے
-        browser: ['Ubuntu', 'Chrome', '20.0.04']
+        browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // 🔑 پیرنگ کوڈ کی درخواست (ایک بار جنریٹ ہوگا اور کیو آر کے ساتھ ویلڈ رہے گا)
+    // آپ کا اوریجنل لاجک (8 سیکنڈ والا) بالکل من و عن بحال کر دیا گیا ہے
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
-                    
-                    const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
-                        status: 'waiting_for_scan_or_code',
-                        qrCode: currentData?.qrCode || null
+                        status: 'waiting_for_scan_or_code'
                     });
                     console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 4000); // 4 سیکنڈ کا پرفیکٹ ڈیلے تاکہ سوکٹ صحیح سے تیار ہو جائے
+        }, 8000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 جب بھی کیو آر ریفریش ہوگا، پرانا پیرنگ کوڈ غائب نہیں ہوگا (Perfect Sync)
+        // یہاں صرف لنک کی تبدیلی کی ہے (بغیر کسی ڈیلے کے)
         if (qr) {
-            console.log(`[${phoneNumberId}] 🔳 QR Code Generated/Refreshed`);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            
-            const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
                 qrCode: qrImageUrl,
-                rawQr: qr,
-                status: 'waiting_for_scan_or_code',
-                pairingCode: currentData?.pairingCode || null // پیرنگ کوڈ کو محفوظ رکھے گا
+                status: 'waiting_for_scan_or_code'
             });
         }
 
