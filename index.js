@@ -94,7 +94,6 @@ async function getNextPendingNumber() {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    await delay(1000); 
     return getNextPendingNumber();
 }
 
@@ -159,18 +158,17 @@ async function startDevice(phoneNumberId) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
-    // بالکل آپ کا اوریجنل ساکٹ بغیر کسی چھیڑ چھاڑ کے
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, 
+        printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
         browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // آپ کا اوریجنل لاجک (8 سیکنڈ والا) بالکل من و عن بحال کر دیا گیا ہے
+    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -190,12 +188,11 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // یہاں صرف لنک کی تبدیلی کی ہے (بغیر کسی ڈیلے کے)
+        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
         if (qr) {
             console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
-            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qrImageUrl,
+                qrCode: qr,
                 status: 'waiting_for_scan_or_code'
             });
         }
