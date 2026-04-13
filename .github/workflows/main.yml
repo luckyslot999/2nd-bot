@@ -1,22 +1,51 @@
-services:
-  - type: web
-    name: botzmine-whatsapp-bot
-    env: node
-    region: singapore
-    plan: free
-    buildCommand: npm install
-    startCommand: node index.js
-    autoDeploy: true
+name: W-Broadcaster-Bot
 
-    envVars:
-      - key: FIREBASE_URL
-        sync: false
-      - key: PORT
-        value: 3000
-      - key: NODE_ENV
-        value: production
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
 
-    disk:
-      name: sessions-storage
-      mountPath: /opt/render/project/src
-      sizeGB: 1
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Restore WhatsApp Sessions
+        uses: actions/cache/restore@v4
+        with:
+          path: sessions_*
+          key: whatsapp-sessions-${{ github.run_id }}
+          restore-keys: |
+            whatsapp-sessions-
+
+      - name: Start Multi-Device Broadcaster
+        env:
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+        run: npm start
+
+      - name: Save WhatsApp Sessions
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sessions_*
+          key: whatsapp-sessions-${{ github.run_id }}
