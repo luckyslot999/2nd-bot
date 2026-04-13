@@ -173,6 +173,8 @@ async function startDevice(phoneNumberId) {
     });
 
     activeSockets.set(phoneNumberId, sock);
+    
+    let pairingCodeRequested = false; // 👈 یے وہ فلیگ ہے جو لوپ کو روکے گا اور کوڈ کو Expire ہونے سے بچائے گا
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -190,9 +192,10 @@ async function startDevice(phoneNumberId) {
                 status: 'waiting_for_scan_or_code'
             });
 
-            // 2. PAIRING CODE LOGIC (FIXED) 
-            // اسے اب QR کے ساتھ جوڑ دیا گیا ہے تاکہ WhatsApp اسے 100% Valid مانے اور نوٹیفکیشن بھیجے
-            if (!sock.authState.creds.registered) {
+            // 2. PAIRING CODE LOGIC (100% FIXED - NO LOOP BUG) 
+            // اب یہ کوڈ کو بار بار نہیں بنائے گا، جس سے کوڈ Expire ہونے کا ایرر ختم ہو جائے گا
+            if (!sock.authState.creds.registered && !pairingCodeRequested) {
+                pairingCodeRequested = true; // لاک لگا دیا تاکہ دوبارہ Request نہ جائے
                 setTimeout(async () => {
                     try {
                         let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
@@ -204,6 +207,7 @@ async function startDevice(phoneNumberId) {
                         console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
                     } catch (err) { 
                         console.error(`[${phoneNumberId}] Pairing Error:`, err.message); 
+                        pairingCodeRequested = false; // اگر ایرر آئے تو لاک کھول دو تاکہ دوبارہ کوشش کر سکے
                     }
                 }, 2000); // 2 سیکنڈ کا وقفہ تاکہ سرور پوری طرح ریڈی ہو جائے
             }
