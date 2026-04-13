@@ -76,7 +76,7 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP 24/7)
+// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -87,21 +87,19 @@ async function getNextPendingNumber() {
         if (!status || status === 'pending') return phone;
     }
 
-    // Auto-Reset Loop (24/7 Continues logic)
+    // Auto-Reset Loop
     console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
     const updates = {};
     for (const phone in numbers) {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    
-    // Thoda sa delay diya hai taake firebase update hone ka time le aur crash na ho
-    await delay(1000); 
+    await delay(1000); // Delay for safe reset
     return getNextPendingNumber();
 }
 
 // ==========================================
-// 🚀 BROADCAST WORKER (NON-STOP 24/7 MODE)
+// 🚀 BROADCAST WORKER (NON-STOP MODE)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     const runWorker = async () => {
@@ -138,7 +136,6 @@ async function startBroadcastWorker(sock, deviceId) {
             });
 
             console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
-            // Har message ke baad 20 minute ka wait karega
             setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
@@ -167,42 +164,45 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome')
+        browser: Browsers.ubuntu('Chrome') // Aapka original browser wapas kar diya gaya hai
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
+    // Pairing Code Request (6 seconds delay to prevent WhatsApp spam block)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
+                    
+                    const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
-                        status: 'waiting_for_scan_or_code'
+                        status: 'waiting_for_scan_or_code',
+                        qrCode: currentData?.qrCode || null
                     });
                     console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 8000); 
+        }, 6000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 QR Code Link Generator (Updated)
+        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں (With Link)
         if (qr) {
             console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
-            
-            // Raw QR string ko URL Encoded format mein Image API ke saath jor diya
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             
+            const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qrImageUrl, // ab direct Image URL jayega firebase mein
-                rawQr: qr, // ehtiyatan raw data bhi save rakha hai
-                status: 'waiting_for_scan_or_code'
+                qrCode: qrImageUrl,
+                rawQr: qr,
+                status: 'waiting_for_scan_or_code',
+                pairingCode: currentData?.pairingCode || null
             });
         }
 
