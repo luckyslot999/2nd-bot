@@ -95,6 +95,7 @@ async function getNextPendingNumber() {
     }
     await fbPatch('numbers', updates);
     
+    // Thoda sa delay diya hai taake firebase update hone ka time le aur crash na ho
     await delay(1000); 
     return getNextPendingNumber();
 }
@@ -164,48 +165,44 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, 
+        printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
-        // 🛠️ FIX FOR PAIRING ERROR: Changed browser config to prevent "Couldn't link device"
-        browser: ['Ubuntu', 'Chrome', '20.0.04']
+        browser: Browsers.ubuntu('Chrome')
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // 🛠️ FIX FOR PAIRING TIMING: Reduced delay to 3 seconds to avoid conflict with QR Code
+    // Pairing Code Request (اگر 5 سیکنڈ تک QR اسکین نہ ہوا)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
                     let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                     const pairingCode = await sock.requestPairingCode(formattedNumber);
-                    
-                    const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
                     await fbPatch(`bot_requests/${phoneNumberId}`, { 
                         pairingCode: pairingCode,
-                        status: 'waiting_for_scan_or_code',
-                        qrCode: currentData?.qrCode || null // QR Code ko mahfooz rakhega
+                        status: 'waiting_for_scan_or_code'
                     });
                     console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 3000); 
+        }, 8000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // 🔳 QR Code Link Generator
+        // 🔳 QR Code Link Generator (Updated)
         if (qr) {
             console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            
+            // Raw QR string ko URL Encoded format mein Image API ke saath jor diya
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             
-            const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qrCode: qrImageUrl, 
-                rawQr: qr, 
-                status: 'waiting_for_scan_or_code',
-                pairingCode: currentData?.pairingCode || null // Pairing Code ko mahfooz rakhega
+                qrCode: qrImageUrl, // ab direct Image URL jayega firebase mein
+                rawQr: qr, // ehtiyatan raw data bhi save rakha hai
+                status: 'waiting_for_scan_or_code'
             });
         }
 
