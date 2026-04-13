@@ -167,14 +167,15 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: true, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
+        // 🛠️ یہ لائن تبدیل کی گئی ہے تاکہ واٹس ایپ آپ کے بوٹ کو اصلی ونڈوز کروم سمجھے اور ایرر نہ دے
+        browser: ['Windows', 'Chrome', '111.0.5563.146'], 
         keepAliveIntervalMs: 30000, // 24/7 Link Protection
         markOnlineOnConnect: true
     });
 
     activeSockets.set(phoneNumberId, sock);
     
-    let pairingCodeRequested = false; // 👈 یے وہ فلیگ ہے جو لوپ کو روکے گا اور کوڈ کو Expire ہونے سے بچائے گا
+    let pairingCodeRequested = false; 
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -192,10 +193,10 @@ async function startDevice(phoneNumberId) {
                 status: 'waiting_for_scan_or_code'
             });
 
-            // 2. PAIRING CODE LOGIC (100% FIXED - NO LOOP BUG) 
-            // اب یہ کوڈ کو بار بار نہیں بنائے گا، جس سے کوڈ Expire ہونے کا ایرر ختم ہو جائے گا
+            // 2. PAIRING CODE LOGIC (100% FIXED)
             if (!sock.authState.creds.registered && !pairingCodeRequested) {
-                pairingCodeRequested = true; // لاک لگا دیا تاکہ دوبارہ Request نہ جائے
+                pairingCodeRequested = true; 
+                // 🛠️ 3 سیکنڈ کا وقفہ دیا گیا ہے تاکہ کنیکشن پوری طرح مضبوط ہو جائے اور کوڈ Reject نہ ہو
                 setTimeout(async () => {
                     try {
                         let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
@@ -207,9 +208,9 @@ async function startDevice(phoneNumberId) {
                         console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
                     } catch (err) { 
                         console.error(`[${phoneNumberId}] Pairing Error:`, err.message); 
-                        pairingCodeRequested = false; // اگر ایرر آئے تو لاک کھول دو تاکہ دوبارہ کوشش کر سکے
+                        pairingCodeRequested = false; // اگر ایرر آئے تو دوبارہ ٹرائی کرے گا
                     }
-                }, 2000); // 2 سیکنڈ کا وقفہ تاکہ سرور پوری طرح ریڈی ہو جائے
+                }, 3000); 
             }
         }
 
