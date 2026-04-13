@@ -1,27 +1,19 @@
-name: W-Broadcaster-Bot
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *' 
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350 # GitHub limit is 360 mins (6 hours). This will prevent crash errors.
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Dependencies
-        run: npm install
-
-      - name: Start Multi-Device Broadcaster
-        env:
-          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
-        run: npm start
+services:
+  - type: web
+    name: whatsapp-baileys-bot
+    env: node
+    plan: starter # Starter plan is required for Persistent Disks on Render
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /status?phoneNumber=system_ping
+    disk:
+      name: bot-auth-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: FIREBASE_DATABASE_URL
+        sync: false # Set this in the Render Dashboard (e.g. https://your-project.firebaseio.com)
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false # Set this in the Render Dashboard (Base64 encoded Firebase JSON)
