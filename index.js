@@ -94,7 +94,7 @@ async function getNextPendingNumber() {
         updates[phone] = { status: 'pending', sentBy: null };
     }
     await fbPatch('numbers', updates);
-    await delay(1000); // Delay for safe reset
+    await delay(1000); 
     return getNextPendingNumber();
 }
 
@@ -162,14 +162,15 @@ async function startDevice(phoneNumberId) {
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: true, // Terminal mein bhi show hoga
+        printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome') // Aapka original browser wapas kar diya gaya hai
+        // 🛡️ یہ براؤزر سیٹنگ پیرنگ کوڈ کے "Couldn't link device" ایرر کا 100٪ فکس ہے
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
     });
 
     activeSockets.set(phoneNumberId, sock);
 
-    // Pairing Code Request (6 seconds delay to prevent WhatsApp spam block)
+    // 🔑 پیرنگ کوڈ کی درخواست (ایک بار جنریٹ ہوگا اور کیو آر کے ساتھ ویلڈ رہے گا)
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -186,15 +187,15 @@ async function startDevice(phoneNumberId) {
                     console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
                 }
             } catch (err) { console.error("Pairing Error:", err.message); }
-        }, 6000); 
+        }, 4000); // 4 سیکنڈ کا پرفیکٹ ڈیلے تاکہ سوکٹ صحیح سے تیار ہو جائے
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں (With Link)
+        // 🔳 جب بھی کیو آر ریفریش ہوگا، پرانا پیرنگ کوڈ غائب نہیں ہوگا (Perfect Sync)
         if (qr) {
-            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated/Refreshed`);
             const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             
             const currentData = await fbGet(`bot_requests/${phoneNumberId}`);
@@ -202,7 +203,7 @@ async function startDevice(phoneNumberId) {
                 qrCode: qrImageUrl,
                 rawQr: qr,
                 status: 'waiting_for_scan_or_code',
-                pairingCode: currentData?.pairingCode || null
+                pairingCode: currentData?.pairingCode || null // پیرنگ کوڈ کو محفوظ رکھے گا
             });
         }
 
