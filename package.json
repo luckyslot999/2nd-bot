@@ -1,29 +1,17 @@
 {
-  "name": "botzmine-whatsapp-bot",
+  "name": "w-broadcaster-bot",
   "version": "1.0.0",
-  "description": "Botzmine WhatsApp Bot - 24/7 Broadcast Engine",
+  "description": "Multi-Device WhatsApp SaaS Broadcaster",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "dotenv": "^16.4.5",
-    "pino": "^9.3.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
+    "pino": "^9.3.2",
+    "dotenv": "^16.4.5"
   },
   "engines": {
-    "node": ">=18.0.0"
-  },
-  "keywords": [
-    "whatsapp",
-    "bot",
-    "baileys",
-    "broadcast"
-  ],
-  "author": "Botzmine",
-  "license": "ISC"
+    "node": ">=20.0.0"
+  }
 }
