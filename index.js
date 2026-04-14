@@ -1,8 +1,8 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, initAuthCreds, BufferJSON, proto, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
-const http = require('http'); // 🌐 Node.js Built-in HTTP (100% Error Free for Render)
+const http = require('http');
 
 // ==========================================
 // 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
@@ -15,7 +15,7 @@ process.on('unhandledRejection', (reason, p) => {
 });
 
 const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
-const activeSockets = new Map(); // 🛠️ Zombie Socket Killer Manager
+const activeSockets = new Map();
 
 // ==========================================
 // 🌐 NATIVE HTTP SERVER (FOR RENDER 24/7 UPTIME)
@@ -33,11 +33,11 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`🌐 Web server is listening on port ${PORT} (Prevents Render Deploy Failures)`);
+    console.log(`🌐 Web server is listening on port ${PORT}`);
 });
 
 // ==========================================
-// 🛠️ FIREBASE UTILITY FUNCTIONS (WITH AUTO-RETRY)
+// 🛠️ FIREBASE UTILITY FUNCTIONS
 // ==========================================
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -85,6 +85,81 @@ async function fbDelete(path, retries = 3) {
 }
 
 // ==========================================
+// 🔥 FIREBASE AUTH STATE (RENDER SURVIVAL MODE)
+// ==========================================
+// یہ فنکشن واٹس ایپ سیشن کو Render کے ڈیلیٹ ہونے سے بچائے گا اور فائر بیس میں محفوظ کرے گا
+async function useFirebaseAuthState(deviceId) {
+    const sessionPath = `whatsapp_sessions/${deviceId}`;
+    
+    let sessionData = await fbGet(sessionPath);
+    let creds;
+    let keys = {};
+
+    if (sessionData && sessionData.creds) {
+        console.log(`[${deviceId}] ♻️ Restoring WhatsApp session from Firebase...`);
+        creds = JSON.parse(JSON.stringify(sessionData.creds), BufferJSON.reviver);
+        keys = sessionData.keys ? JSON.parse(JSON.stringify(sessionData.keys), BufferJSON.reviver) : {};
+    } else {
+        console.log(`[${deviceId}] 🆕 Creating new WhatsApp session...`);
+        creds = initAuthCreds();
+    }
+
+    let isSaving = false;
+    let hasChanges = false;
+
+    const saveState = async () => {
+        hasChanges = true;
+        if (isSaving) return;
+        isSaving = true;
+        
+        // Save to DB every 5 seconds to prevent rate limits
+        setTimeout(async () => {
+            if (hasChanges) {
+                try {
+                    const dataToSave = JSON.parse(JSON.stringify({ creds, keys }, BufferJSON.replacer));
+                    await fbPatch(sessionPath, dataToSave);
+                    hasChanges = false;
+                } catch (error) {
+                    console.error(`[${deviceId}] ❌ Failed to sync session to DB:`, error.message);
+                }
+            }
+            isSaving = false;
+        }, 5000);
+    };
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: (type, ids) => {
+                    const data = {};
+                    for (const id of ids) {
+                        let value = keys[`${type}-${id}`];
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        data[id] = value;
+                    }
+                    return data;
+                },
+                set: (data) => {
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            if (value) keys[key] = value;
+                            else delete keys[key];
+                        }
+                    }
+                    saveState();
+                }
+            }
+        },
+        saveCreds: () => saveState()
+    };
+}
+
+// ==========================================
 // ⚙️ SETTINGS 
 // ==========================================
 async function getSettings() {
@@ -108,9 +183,6 @@ function formatPhoneNumberForPairing(phoneNumber) {
     return num;
 }
 
-// ==========================================
-// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC 
-// ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
     if (!numbers) return null;
@@ -143,48 +215,67 @@ async function getNextPendingNumber() {
     return null; 
 }
 
+// 🕒 ٹائم آؤٹ فنکشن تاکہ میسج سینڈ ہوتے وقت بوٹ ہینگ (Hang) نہ ہو
+const promiseTimeout = (ms, promise) => {
+    let timeout = new Promise((resolve, reject) => {
+        let id = setTimeout(() => {
+            clearTimeout(id);
+            reject(new Error(`Timed out in ${ms}ms`));
+        }, ms);
+    });
+    return Promise.race([promise, timeout]);
+};
+
 // ==========================================
-// 🚀 UNLIMITED LIFETIME BROADCAST WORKER (EVERY 20 MINS)
+// 🚀 UNLIMITED LIFETIME BROADCAST WORKER
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
     console.log(`[${deviceId}] 🟢 Broadcast Worker activated! Running Lifetime mode...`);
     
-    const runWorker = async () => {
+    let isRunning = true;
+
+    while (isRunning) {
         try {
+            if (sock?.ws?.readyState !== 1) {
+                console.log(`[${deviceId}] ⚠️ Socket not ready. Waiting...`);
+                await delay(10000);
+                continue;
+            }
+
             const settings = await getSettings();
-            
-            // نمبر اٹھانا
             let rawPhone = await getNextPendingNumber();
             
             if (!rawPhone) {
-                setTimeout(runWorker, 15 * 1000); 
-                return;
+                await delay(15 * 1000); 
+                continue;
             }
             
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
-            const waStatus = await sock.onWhatsApp(jid);
+            const waStatus = await promiseTimeout(15000, sock.onWhatsApp(jid)).catch(() => null);
+            
             if (!waStatus || waStatus.length === 0 || !waStatus[0].exists) {
                 console.log(`[${deviceId}] ⏩ Skipped (No WhatsApp): ${phone}`);
                 await fbPatch(`numbers/${rawPhone}`, { status: 'skipped_no_wa', pickedBy: null });
-                setTimeout(runWorker, 5000); 
-                return;
+                await delay(5000); 
+                continue;
             }
             
             console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
-            await sock.presenceSubscribe(jid);
-            await sock.sendPresenceUpdate('composing', jid);
+            await sock.presenceSubscribe(jid).catch(()=>{}).catch(()=>{});
+            await sock.sendPresenceUpdate('composing', jid).catch(()=>{});
             
             const typingTime = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
             await delay(typingTime);
             
-            await sock.sendPresenceUpdate('paused', jid);
-            await sock.sendMessage(jid, { text: settings.messageTemplate });
+            await sock.sendPresenceUpdate('paused', jid).catch(()=>{});
+            
+            // 30 سیکنڈ ٹائم آؤٹ تاکہ بوٹ پھنسے نا
+            await promiseTimeout(30000, sock.sendMessage(jid, { text: settings.messageTemplate }));
             
             const timestamp = new Date().toISOString();
             
-            // فائر بیس اپڈیٹ 
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp: timestamp, pickedBy: null });
             await fbPatch(`sent_history/${deviceId}`, { [rawPhone]: { timestamp: timestamp } });
             
@@ -193,17 +284,16 @@ async function startBroadcastWorker(sock, deviceId) {
 
             console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
             
-            // ⏳ ٹھیک 20 منٹ کا ڈیلے
+            // ⏳ ٹھیک 20 منٹ کا ڈیلے (Delay)
             const delayMs = 20 * 60 * 1000; // 20 Minutes
             console.log(`[${deviceId}] ⏳ Waiting 20 minutes before sending the next message...`);
-            setTimeout(runWorker, delayMs);
+            await delay(delayMs);
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
-            setTimeout(runWorker, 15 * 1000); 
+            await delay(15 * 1000); 
         }
-    };
-    runWorker();
+    }
 }
 
 // ==========================================
@@ -215,10 +305,8 @@ async function startDevice(phoneNumberId) {
 
     console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
-    const sessionDir = `sessions_${phoneNumberId}`;
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
-    
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    // 🔥 سیشن اب فائر بیس سے آئے گا تاکہ 24/7 زندہ رہے
+    const { state, saveCreds } = await useFirebaseAuthState(phoneNumberId);
     const { version } = await fetchLatestBaileysVersion();
     
     const sock = makeWASocket({
@@ -259,14 +347,8 @@ async function startDevice(phoneNumberId) {
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
-            
             await fbPatch(`qrcodes/${phoneNumberId}`, { qr_link: qrApiLink, last_updated: new Date().toISOString() });
-            
-            await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qr: qrApiLink, 
-                status: 'waiting_for_scan_or_code',
-                last_updated: new Date().toISOString() 
-            });
+            await fbPatch(`bot_requests/${phoneNumberId}`, { qr: qrApiLink, status: 'waiting_for_scan_or_code', last_updated: new Date().toISOString() });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
         }
         
@@ -289,8 +371,8 @@ async function startDevice(phoneNumberId) {
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
             if (reason === DisconnectReason.loggedOut || reason === 401) {
-                console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
-                fs.rmSync(sessionDir, { recursive: true, force: true });
+                console.log(`[${phoneNumberId}] ❌ Logged out. Deleting Firebase session...`);
+                await fbDelete(`whatsapp_sessions/${phoneNumberId}`); // فائر بیس سے سیشن اڑانا
                 activeSockets.delete(phoneNumberId);
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
@@ -319,31 +401,26 @@ async function pollFirebaseForDevices() {
             for (const phoneId in requests) {
                 const reqData = requests[phoneId];
                 
-                // 🛑 اپڈیٹ: اگر یوزر دوبارہ generate_code کی ریکویسٹ بھیجے تو پچھلا سیشن ختم کر کے نیا بنائے گا
                 if (reqData.action === 'generate_qr' || reqData.action === 'generate_code') {
                     
                     console.log(`[${phoneId}] 🔄 New Pairing Request Received! Processing Fresh Connection...`);
                     
-                    // ایکشن کو فورا processing کر دیں تاکہ لوپ نہ بنے
                     await fbPatch(`bot_requests/${phoneId}`, { action: 'processing', status: 'processing' });
 
-                    const sessionDir = `sessions_${phoneId}`;
-                    
                     if (activeSockets.has(phoneId)) {
-                        console.log(`[${phoneId}] 🛑 Killing old background socket to prevent conflicts...`);
+                        console.log(`[${phoneId}] 🛑 Killing old background socket safely...`);
                         const oldSock = activeSockets.get(phoneId);
-                        if (oldSock && oldSock.ws) {
-                            oldSock.ws.close(); 
+                        if (oldSock && oldSock.end) {
+                            oldSock.end(undefined); 
                         }
                         activeSockets.delete(phoneId);
+                        await delay(2000); 
                     }
 
-                    if (fs.existsSync(sessionDir)) {
-                        console.log(`[${phoneId}] 🧹 Cleaning old session data before new pairing code...`);
-                        fs.rmSync(sessionDir, { recursive: true, force: true });
-                    }
+                    console.log(`[${phoneId}] 🧹 Cleaning old database session...`);
+                    await fbDelete(`whatsapp_sessions/${phoneId}`); // پرانا سیشن فائر بیس سے ڈیلیٹ کرنا
 
-                    startDevice(phoneId);
+                    setTimeout(() => startDevice(phoneId), 2000);
                 }
             }
         }
@@ -356,7 +433,7 @@ async function pollFirebaseForDevices() {
                     startDevice(deviceId);
                 } 
                 else if (deviceData.status === 'connected' && !activeSockets.has(deviceId)) {
-                    startDevice(deviceId);
+                    startDevice(deviceId); // Render ری سٹارٹ پر آٹو کنیکٹ کرے گا
                 }
             }
         }
@@ -373,11 +450,8 @@ setInterval(() => {
     console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeSockets.size} | Time: ${new Date().toISOString()}`);
 }, 5 * 60 * 1000); 
 
-// ==========================================
-// 🚀 INITIALIZATION WRAPPED IN TRY-CATCH
-// ==========================================
 if (!FIREBASE_URL) { 
-    console.error("❌ FIREBASE_URL is missing in .env file! Bot logic will not run, but web server remains online.");
+    console.error("❌ FIREBASE_URL is missing in .env file! Bot logic will not run.");
 } else {
     try {
         pollFirebaseForDevices();
