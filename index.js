@@ -2,7 +2,7 @@ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
-const http = require('http'); 
+const http = require('http');
 
 // ==========================================
 // 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
@@ -18,234 +18,140 @@ const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
 const activeSockets = new Map(); 
 
 // ==========================================
-// 🌐 NATIVE HTTP SERVER (FOR RENDER 24/7 UPTIME)
+// 🌐 NATIVE HTTP SERVER (FOR UPTIME)
 // ==========================================
 const PORT = process.env.PORT || 3000;
-
 const server = http.createServer((req, res) => {
-    if (req.url === '/ping') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('pong');
-    } else {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Bot is running continuously on Render! 🚀');
-    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Botzmine WhatsApp Bot is running... 🚀');
 });
-
 server.listen(PORT, () => {
     console.log(`🌐 Web server is listening on port ${PORT}`);
 });
 
 // ==========================================
-// 🛠️ FIREBASE UTILITY FUNCTIONS (WITH AUTO-RETRY)
+// 🛠️ FIREBASE UTILITY FUNCTIONS
 // ==========================================
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function fbGet(path, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const res = await fetch(`${FIREBASE_URL}/${path}.json`);
-            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            return await res.json();
-        } catch (e) {
-            if (i === retries - 1) return null;
-            await delay(2000);
-        }
-    }
+async function fbGet(path) {
+    try {
+        const res = await fetch(`${FIREBASE_URL}/${path}.json`);
+        return await res.json();
+    } catch (e) { return null; }
 }
 
-async function fbPatch(path, data, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const res = await fetch(`${FIREBASE_URL}/${path}.json`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
-            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            return;
-        } catch (e) {
-            if (i === retries - 1) return;
-            await delay(2000);
-        }
-    }
+async function fbPatch(path, data) {
+    try {
+        await fetch(`${FIREBASE_URL}/${path}.json`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+    } catch (e) { console.error("Firebase Patch Error:", e.message); }
 }
 
-async function fbDelete(path, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const res = await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' });
-            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            return;
-        } catch (e) {
-            if (i === retries - 1) return;
-            await delay(2000);
-        }
-    }
+async function fbDelete(path) {
+    try {
+        await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' });
+    } catch (e) { console.error("Firebase Delete Error:", e.message); }
 }
 
 // ==========================================
-// ⚙️ SETTINGS & ANTI-BAN LOGIC
+// ⚙️ SETTINGS (NO LIMIT & 20 MIN DELAY)
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
     return { 
-        messageTemplate: data?.messageTemplate || "Hello, this is a message from Botzmine!", 
-        dailyLimitPerDevice: 35, 
-        minDelayMinutes: 15,     
-        maxDelayMinutes: 20      
+        messageTemplate: data?.messageTemplate || "Hello, this is an automated message from Botzmine!", 
+        delayMinutes: 20 
     };
-}
-
-function getRandomDelayMs(minMinutes, maxMinutes) {
-    const min = minMinutes * 60 * 1000;
-    const max = maxMinutes * 60 * 1000;
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function getMsUntilMidnight() {
-    const now = new Date();
-    const midnight = new Date(now);
-    midnight.setHours(24, 0, 0, 0);
-    return midnight.getTime() - now.getTime();
-}
-
-function formatNumber(phone) {
-    return phone.replace(/\D/g, ''); 
 }
 
 function formatPhoneNumberForPairing(phoneNumber) {
     let num = phoneNumber.toString().replace(/\D/g, ''); 
-    if (num.startsWith('03')) {
-        return '92' + num.substring(1);
-    } else if (num.startsWith('3') && num.length === 10) {
-        return '92' + num;
-    }
+    if (num.startsWith('03')) return '92' + num.substring(1);
+    if (num.startsWith('3') && num.length === 10) return '92' + num;
     return num;
 }
 
 // ==========================================
-// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC 
+// 🔄 NUMBER FETCHING LOGIC (AUTO-LOOP)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
     if (!numbers) return null;
 
-    let foundPhone = null;
-    let hasAnyNumber = false;
-
     for (const phone in numbers) {
-        hasAnyNumber = true;
         const status = numbers[phone].status;
-        
-        if (!status || status === 'pending' || status === 'processing') {
-            foundPhone = phone;
-            break; 
-        }
+        if (!status || status === 'pending') return phone;
     }
 
-    if (foundPhone) return foundPhone;
-
-    if (hasAnyNumber) {
-        console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting all numbers back to pending...\n`);
-        const updates = {};
-        for (const phone in numbers) {
-            updates[phone] = { status: 'pending', sentBy: null, timestamp: null, pickedBy: null };
-        }
-        await fbPatch('numbers', updates);
-        return await getNextPendingNumber();
+    // Auto-Reset Loop
+    console.log(`♻️ [AUTO-LOOP] Resetting numbers for 24/7 cycle...`);
+    const updates = {};
+    for (const phone in numbers) {
+        updates[phone] = { status: 'pending', sentBy: null };
     }
-
-    return null; 
+    await fbPatch('numbers', updates);
+    await delay(1000); // Only added to prevent server crash during reset
+    return getNextPendingNumber();
 }
 
 // ==========================================
-// 🚀 24/7 ANTI-BAN BROADCAST WORKER
+// 🚀 BROADCAST WORKER (NON-STOP MODE)
 // ==========================================
 async function startBroadcastWorker(sock, deviceId) {
-    console.log(`[${deviceId}] 🟢 24/7 Broadcast Worker activated! System will loop continuously.`);
-    
     const runWorker = async () => {
         try {
-            if (sock.ws.readyState !== 1) { 
-                console.log(`[${deviceId}] ⚠️ Socket is not open. Pausing worker until reconnect...`);
-                setTimeout(runWorker, 10000);
-                return;
-            }
+            if (!activeSockets.has(deviceId)) return;
 
             const settings = await getSettings();
-            let stats = await fbGet(`devices/${deviceId}`);
-            const today = new Date().toISOString().split('T')[0];
-            
-            let sentToday = 0;
-            if (stats && stats.date === today) {
-                sentToday = stats.sentToday || 0;
-            } else {
-                await fbPatch(`devices/${deviceId}`, { sentToday: 0, date: today });
-            }
-
-            if (sentToday >= settings.dailyLimitPerDevice) {
-                const sleepTimeMs = getMsUntilMidnight();
-                console.log(`[${deviceId}] 🛑 Daily limit reached. Sleeping until midnight...`);
-                setTimeout(runWorker, sleepTimeMs);
-                return;
-            }
-            
             let rawPhone = await getNextPendingNumber();
             
             if (!rawPhone) {
-                setTimeout(runWorker, 15 * 1000); 
+                setTimeout(runWorker, 30000); 
                 return;
             }
             
-            const phone = formatNumber(rawPhone);
+            const phone = rawPhone.replace(/\D/g, '');
             const jid = `${phone}@s.whatsapp.net`;
             
-            const waStatus = await sock.onWhatsApp(jid);
-            if (!waStatus || waStatus.length === 0 || !waStatus[0].exists) {
-                console.log(`[${deviceId}] ⏩ Skipped (No WhatsApp): ${phone}`);
-                await fbPatch(`numbers/${rawPhone}`, { status: 'skipped_no_wa', pickedBy: null });
-                setTimeout(runWorker, 5000); 
-                return;
-            }
-            
             console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
-            await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate('composing', jid);
+            await delay(Math.random() * 5000 + 3000);
             
-            const typingTime = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
-            await delay(typingTime);
-            
-            await sock.sendPresenceUpdate('paused', jid);
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
             const timestamp = new Date().toISOString();
-            await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp: timestamp, pickedBy: null });
-            await fbPatch(`sent_history/${deviceId}`, { [rawPhone]: { timestamp: timestamp } });
-            await fbPatch(`devices/${deviceId}`, { sentToday: sentToday + 1, totalSent: (stats?.totalSent || 0) + 1, date: today, lastActive: timestamp, status: 'connected' });
+            const today = timestamp.split('T')[0];
+            let stats = await fbGet(`devices/${deviceId}`);
 
-            console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
-            
-            const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
-            console.log(`[${deviceId}] ⏳ Waiting ${(delayMs / 60000).toFixed(1)} minutes before next message...`);
-            setTimeout(runWorker, delayMs);
+            await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp });
+            await fbPatch(`devices/${deviceId}`, { 
+                totalSent: (stats?.totalSent || 0) + 1, 
+                date: today, 
+                lastActive: timestamp, 
+                status: 'connected' 
+            });
+
+            console.log(`[${deviceId}] ✅ Sent to ${phone}. Next in 20 mins.`);
+            setTimeout(runWorker, settings.delayMinutes * 60 * 1000); 
             
         } catch (error) {
-            console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
-            setTimeout(runWorker, 15 * 1000); 
+            console.log(`[${deviceId}] ❌ Error:`, error.message);
+            setTimeout(runWorker, 20000); 
         }
     };
     runWorker();
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER & PAIRING LOGIC
+// 📱 DEVICE MANAGER (QR & PAIRING CODE)
 // ==========================================
 async function startDevice(phoneNumberId) {
-    if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
+    if (activeSockets.has(phoneNumberId) && typeof activeSockets.get(phoneNumberId) !== 'string') return;
     activeSockets.set(phoneNumberId, 'initializing');
-
-    console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
     const sessionDir = `sessions_${phoneNumberId}`;
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
@@ -253,105 +159,67 @@ async function startDevice(phoneNumberId) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
-    // 🛠️ TIMEOUT FIXES: Added keepAlive & extended connect timeout
     const sock = makeWASocket({
         version, 
         auth: state, 
-        printQRInTerminal: false, 
+        printQRInTerminal: true, // Terminal mein bhi show hoga
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), 
-        syncFullHistory: false,
-        qrTimeout: 60000, // Maximum stable time for WA Pairing/QR
-        connectTimeoutMs: 60000, 
-        keepAliveIntervalMs: 15000, 
-        generateHighQualityLinkPreview: false
+        browser: Browsers.ubuntu('Chrome')
     });
 
-    activeSockets.set(phoneNumberId, sock); 
+    activeSockets.set(phoneNumberId, sock);
 
-    // 🚀 STABLE PAIRING LOGIC
+    // Pairing Code Request (اگر 8 سیکنڈ تک QR اسکین نہ ہوا) - Your exact original logic
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
-                let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
-                console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code for: ${formattedNumber}...`);
-                const pairingCode = await sock.requestPairingCode(formattedNumber);
-                
-                console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode} (Valid for ~60-90 secs)`);
-                await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                    pairingCode: pairingCode,
-                    status: 'waiting_for_scan_or_code',
-                    last_updated: new Date().toISOString() 
-                });
-            } catch (err) {
-                console.error(`[${phoneNumberId}] ❌ Pairing Code Request Error:`, err.message);
-                await fbPatch(`bot_requests/${phoneNumberId}`, { status: 'failed' });
-            }
-        }, 5000); // 5 sec delay ensures socket is fully stable before requesting code
+                if (activeSockets.has(phoneNumberId) && !sock.authState.creds.registered) {
+                    let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
+                    const pairingCode = await sock.requestPairingCode(formattedNumber);
+                    await fbPatch(`bot_requests/${phoneNumberId}`, { 
+                        pairingCode: pairingCode,
+                        status: 'waiting_for_scan_or_code'
+                    });
+                    console.log(`[${phoneNumberId}] 🔑 PAIRING CODE: ${pairingCode}`);
+                }
+            } catch (err) { console.error("Pairing Error:", err.message); }
+        }, 8000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
+        // اگر QR کوڈ جنریٹ ہو تو فائر بیس پر بھیجیں
         if (qr) {
-            const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED: ${qrApiLink}`);
-            
-            await fbPatch(`qrcodes/${phoneNumberId}`, { qr_link: qrApiLink, last_updated: new Date().toISOString() });
+            console.log(`[${phoneNumberId}] 🔳 QR Code Generated`);
+            const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qr: qrApiLink, 
-                status: 'waiting_for_scan_or_code',
-                last_updated: new Date().toISOString() 
+                qrCode: qrImageUrl,
+                status: 'waiting_for_scan_or_code'
             });
-            await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
         }
-        
-        if (connection === 'open') {
-            const botNumber = sock.user.id.split(':')[0];
-            await fbDelete(`bot_requests/${phoneNumberId}`);
-            await fbDelete(`qrcodes/${phoneNumberId}`);
 
-            console.log(`\n✅ [${phoneNumberId}] STATUS: CONNECTED AS ${botNumber} ✅`);
+        if (connection === 'open') {
+            console.log(`✅ [${phoneNumberId}] CONNECTED`);
+            await fbDelete(`bot_requests/${phoneNumberId}`);
             await fbPatch(`devices/${phoneNumberId}`, { 
                 status: 'connected', 
-                phone: botNumber, 
-                device_id: phoneNumberId, 
-                connected_at: new Date().toISOString() 
+                phone: sock.user.id.split(':')[0], 
+                lastActive: new Date().toISOString() 
             });
-            
-            console.log(`[${phoneNumberId}] ⏳ Stabilizing WhatsApp keys... waiting 10 seconds.`);
-            setTimeout(() => { startBroadcastWorker(sock, phoneNumberId); }, 10000);
+            setTimeout(() => startBroadcastWorker(sock, phoneNumberId), 5000);
         }
         
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const reason = statusCode || DisconnectReason.connectionClosed;
-            console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason Code: ${reason}`);
-            
-            // 🛑 USER LOGGED OUT / UNLINKED 
-            if (reason === DisconnectReason.loggedOut || reason === 401) {
-                console.log(`[${phoneNumberId}] ❌ LOGGED OUT OR UNLINKED BY USER. Deleting session forever...`);
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-                activeSockets.delete(phoneNumberId);
-                await fbDelete(`bot_requests/${phoneNumberId}`);
-                await fbDelete(`qrcodes/${phoneNumberId}`);
-                await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected', phone: null });
-            } 
-            // ⏰ TIMEOUT / EXPIRED HANDLING (FIX FOR YOUR SCREENSHOT)
-            else if (reason === DisconnectReason.timedOut || reason === 408) {
-                console.log(`[${phoneNumberId}] ⏰ Pairing Code / QR EXPIRED! Cleaning up so user can request a fresh one...`);
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-                activeSockets.delete(phoneNumberId);
-                
-                // Set status to expired so frontend can show "Request again"
-                await fbPatch(`bot_requests/${phoneNumberId}`, { status: 'expired' });
-                await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected', phone: null });
-            }
-            // 🔄 OTHER NETWORK ISSUES (Auto Reconnect)
-            else {
-                console.log(`[${phoneNumberId}] 🔄 Connection Dropped. Attempting to reconnect safely...`);
-                await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
-                activeSockets.delete(phoneNumberId); 
+            activeSockets.delete(phoneNumberId);
+
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                console.log(`❌ [${phoneNumberId}] LOGGED OUT`);
+                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+                await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected' });
+            } else {
+                console.log(`🔄 [${phoneNumberId}] RECONNECTING...`);
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
         }
@@ -361,76 +229,64 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🔄 DYNAMIC SYSTEM POLLING (LISTENS FOR NEW REQUESTS)
+// 🕒 24-HOUR INACTIVITY CHECKER
 // ==========================================
-async function pollFirebaseForDevices() {
-    console.log("🚀 Botzmine Task System Started! Listening for users...");
-    
-    const checkSystem = async () => {
-        let requests = await fbGet('bot_requests');
-        if (requests) {
-            for (const phoneId in requests) {
-                const reqData = requests[phoneId];
-                
-                if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
-                    const sessionDir = `sessions_${phoneId}`;
-                    
-                    console.log(`[${phoneId}] 🔔 NEW REQUEST DETECTED! Preparing fresh connection...`);
+async function checkInactiveDevices() {
+    const devices = await fbGet('devices');
+    if (!devices) return;
 
-                    if (activeSockets.has(phoneId)) {
-                        console.log(`[${phoneId}] 🛑 Killing old background socket for fresh start...`);
-                        const oldSock = activeSockets.get(phoneId);
-                        if (oldSock && oldSock.ws) {
-                            oldSock.ws.close(); 
-                        }
-                        activeSockets.delete(phoneId);
-                    }
+    const now = new Date().getTime();
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
-                    if (fs.existsSync(sessionDir)) {
-                        console.log(`[${phoneId}] 🧹 Cleaning old session data to provide a NEW Pairing Code...`);
-                        fs.rmSync(sessionDir, { recursive: true, force: true });
-                    }
-
-                    await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
-                    startDevice(phoneId);
-                }
+    for (const deviceId in devices) {
+        const device = devices[deviceId];
+        if (device.status !== 'disconnected' && device.lastActive) {
+            const lastActiveTime = new Date(device.lastActive).getTime();
+            if (now - lastActiveTime > TWENTY_FOUR_HOURS) {
+                console.log(`⚠️ [${deviceId}] No activity in 24h. Cleaning session...`);
+                await fbPatch(`devices/${deviceId}`, { status: 'disconnected' });
+                if (activeSockets.has(deviceId)) activeSockets.delete(deviceId);
+                const sessionDir = `sessions_${deviceId}`;
+                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
             }
         }
-
-        let devices = await fbGet('devices');
-        if (devices) {
-            for (const deviceId in devices) {
-                const deviceData = devices[deviceId];
-                if ((deviceData.status === 'pending' || deviceData.status === 'reconnecting') && !activeSockets.has(deviceId)) {
-                    startDevice(deviceId);
-                } 
-                else if (deviceData.status === 'connected' && !activeSockets.has(deviceId)) {
-                    startDevice(deviceId);
-                }
-            }
-        }
-    };
-
-    await checkSystem();
-    setInterval(checkSystem, 5000); 
+    }
 }
 
 // ==========================================
-// 💓 GITHUB ACTIONS / RENDER HEARTBEAT
+// 🔄 SYSTEM POLLING
 // ==========================================
-setInterval(() => {
-    console.log(`💓 [SYSTEM HEARTBEAT] Active Devices Running: ${activeSockets.size} | Time: ${new Date().toISOString()}`);
-}, 5 * 60 * 1000); 
+async function pollFirebase() {
+    setInterval(async () => {
+        const requests = await fbGet('bot_requests');
+        if (requests) {
+            for (const id in requests) {
+                if (requests[id].action && requests[id].status !== 'processing' && requests[id].status !== 'waiting_for_scan_or_code') {
+                    await fbPatch(`bot_requests/${id}`, { status: 'processing' });
+                    startDevice(id);
+                }
+            }
+        }
+
+        const devices = await fbGet('devices');
+        if (devices) {
+            for (const id in devices) {
+                if ((devices[id].status === 'pending' || devices[id].status === 'connected') && !activeSockets.has(id)) {
+                    startDevice(id);
+                }
+            }
+        }
+    }, 10000);
+
+    setInterval(() => checkInactiveDevices(), 10 * 60 * 1000); 
+}
 
 // ==========================================
-// 🚀 INITIALIZATION WRAPPED IN TRY-CATCH
+// 🚀 START
 // ==========================================
-if (!FIREBASE_URL) { 
-    console.error("❌ FIREBASE_URL is missing in .env file! Bot logic will not run, but web server remains online.");
+if (FIREBASE_URL) {
+    pollFirebase();
+    console.log("🚀 Botzmine Engine Started!");
 } else {
-    try {
-        pollFirebaseForDevices();
-    } catch (error) {
-        console.error("❌ Critical Error starting Bot System: ", error);
-    }
+    console.error("❌ FIREBASE_URL missing!");
 }
