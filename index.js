@@ -33,7 +33,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`🌐 Web server is listening on port ${PORT} (Prevents Deploy Failures)`);
+    console.log(`🌐 Web server is listening on port ${PORT} (Prevents Render Deploy Failures)`);
 });
 
 // ==========================================
@@ -233,7 +233,7 @@ async function startBroadcastWorker(sock, deviceId) {
 }
 
 // ==========================================
-// 📱 DYNAMIC DEVICE MANAGER
+// 📱 DYNAMIC DEVICE MANAGER (FIXED PAIRING LOGIC)
 // ==========================================
 async function startDevice(phoneNumberId) {
     if (activeSockets.has(phoneNumberId) && activeSockets.get(phoneNumberId) !== 'initializing') return;
@@ -242,7 +242,7 @@ async function startDevice(phoneNumberId) {
     console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
     const sessionDir = `sessions_${phoneNumberId}`;
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
     
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
@@ -258,10 +258,16 @@ async function startDevice(phoneNumberId) {
         generateHighQualityLinkPreview: false
     });
 
-    activeSockets.set(phoneNumberId, sock); 
+    activeSockets.set(phoneNumberId, sock); // Keep track of socket for zombie killing
 
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
+            // 🟢 FIX 1: Ensure socket hasn't been closed/replaced before requesting code
+            if (activeSockets.get(phoneNumberId) !== sock) {
+                console.log(`[${phoneNumberId}] 🛑 Skipping Pairing Code Request (Socket replaced or closed)`);
+                return;
+            }
+
             try {
                 let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                 console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code for: ${formattedNumber}...`);
@@ -282,6 +288,7 @@ async function startDevice(phoneNumberId) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
+        // Handle QR if requested
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
@@ -316,7 +323,11 @@ async function startDevice(phoneNumberId) {
             
             if (reason === DisconnectReason.loggedOut || reason === 401) {
                 console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
+                
+                // 🟢 FIX 2: Recreate folder immediately to prevent ENOENT crashes from async cred saves
                 fs.rmSync(sessionDir, { recursive: true, force: true });
+                if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
                 activeSockets.delete(phoneNumberId);
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
@@ -359,6 +370,8 @@ async function pollFirebaseForDevices() {
                     if (fs.existsSync(sessionDir)) {
                         console.log(`[${phoneId}] 🧹 Cleaning old session data before new pairing code...`);
                         fs.rmSync(sessionDir, { recursive: true, force: true });
+                        // 🟢 FIX 3: Ensure folder exists so initialize phase doesn't crash
+                        fs.mkdirSync(sessionDir, { recursive: true });
                     }
 
                     await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
@@ -393,7 +406,7 @@ setInterval(() => {
 }, 5 * 60 * 1000); 
 
 // ==========================================
-// 🚀 INITIALIZATION
+// 🚀 INITIALIZATION WRAPPED IN TRY-CATCH
 // ==========================================
 if (!FIREBASE_URL) { 
     console.error("❌ FIREBASE_URL is missing in .env file! Bot logic will not run, but web server remains online.");
