@@ -1,14 +1,29 @@
 {
   "name": "w-broadcaster-bot",
-  "version": "1.0.0",
-  "description": "Multi-Device WhatsApp SaaS Broadcaster",
+  "version": "2.0.0",
+  "description": "Production WhatsApp broadcasting bot — Baileys + Firebase Realtime DB",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.0",
-    "pino": "^8.19.0",
-    "dotenv": "^16.4.5"
-  }
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "firebase-admin": "^12.2.0",
+    "pino": "^9.2.0",
+    "qrcode": "^1.5.4"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "firebase",
+    "broadcaster"
+  ],
+  "author": "Wajid",
+  "license": "MIT"
 }
