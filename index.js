@@ -2,7 +2,7 @@ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
-const http = require('http'); // 🌐 Node.js Built-in HTTP (100% Error Free for Render)
+const http = require('http'); // 🌐 Node.js Built-in HTTP
 
 // ==========================================
 // 🛡️ ANTI-CRASH (GLOBAL ERROR HANDLERS)
@@ -11,7 +11,7 @@ process.on('uncaughtException', function (err) {
     console.error('🛡️ [ANTI-CRASH] Caught exception: ', err.message);
 });
 process.on('unhandledRejection', (reason, p) => {
-    console.error('🛡️ [ANTI-CRASH] Unhandled Rejection at: Promise', p, 'reason:', reason);
+    console.error('🛡️ [ANTI-CRASH] Unhandled Rejection: ', reason);
 });
 
 const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
@@ -28,12 +28,12 @@ const server = http.createServer((req, res) => {
         res.end('pong');
     } else {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Bot is running continuously on Render! 🚀');
+        res.end('Botzmine Node is running perfectly! 🚀');
     }
 });
 
 server.listen(PORT, () => {
-    console.log(`🌐 Web server is listening on port ${PORT} (Prevents Render Deploy Failures)`);
+    console.log(`🌐 Web server is listening on port ${PORT}`);
 });
 
 // ==========================================
@@ -85,7 +85,7 @@ async function fbDelete(path, retries = 3) {
 }
 
 // ==========================================
-// ⚙️ SETTINGS & ANTI-BAN LOGIC
+// ⚙️ SETTINGS & HELPERS
 // ==========================================
 async function getSettings() {
     const data = await fbGet('settings');
@@ -125,7 +125,7 @@ function formatPhoneNumberForPairing(phoneNumber) {
 }
 
 // ==========================================
-// 🔄 INFINITE LOOP & NUMBER FETCHING LOGIC 
+// 🔄 BROADCAST WORKER (SENDING MESSAGES)
 // ==========================================
 async function getNextPendingNumber() {
     const numbers = await fbGet('numbers');
@@ -147,7 +147,7 @@ async function getNextPendingNumber() {
     if (foundPhone) return foundPhone;
 
     if (hasAnyNumber) {
-        console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting all numbers back to pending...\n`);
+        console.log(`\n♻️ All targets finished! Resetting numbers back to pending...\n`);
         const updates = {};
         for (const phone in numbers) {
             updates[phone] = { status: 'pending', sentBy: null, timestamp: null, pickedBy: null };
@@ -155,15 +155,11 @@ async function getNextPendingNumber() {
         await fbPatch('numbers', updates);
         return await getNextPendingNumber();
     }
-
     return null; 
 }
 
-// ==========================================
-// 🚀 ANTI-BAN BROADCAST WORKER
-// ==========================================
 async function startBroadcastWorker(sock, deviceId) {
-    console.log(`[${deviceId}] 🟢 Broadcast Worker activated! Checking for numbers...`);
+    console.log(`[${deviceId}] 🟢 Broadcast Worker activated!`);
     
     const runWorker = async () => {
         try {
@@ -171,22 +167,18 @@ async function startBroadcastWorker(sock, deviceId) {
             let stats = await fbGet(`devices/${deviceId}`);
             const today = new Date().toISOString().split('T')[0];
             
-            let sentToday = 0;
-            if (stats && stats.date === today) {
-                sentToday = stats.sentToday || 0;
-            } else {
+            let sentToday = stats && stats.date === today ? (stats.sentToday || 0) : 0;
+            if (!stats || stats.date !== today) {
                 await fbPatch(`devices/${deviceId}`, { sentToday: 0, date: today });
             }
 
             if (sentToday >= settings.dailyLimitPerDevice) {
-                const sleepTimeMs = getMsUntilMidnight();
-                console.log(`[${deviceId}] 🛑 Daily limit reached. Sleeping until midnight...`);
-                setTimeout(runWorker, sleepTimeMs);
+                console.log(`[${deviceId}] 🛑 Daily limit reached. Sleeping...`);
+                setTimeout(runWorker, getMsUntilMidnight());
                 return;
             }
             
             let rawPhone = await getNextPendingNumber();
-            
             if (!rawPhone) {
                 setTimeout(runWorker, 15 * 1000); 
                 return;
@@ -203,14 +195,11 @@ async function startBroadcastWorker(sock, deviceId) {
                 return;
             }
             
-            console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate('composing', jid);
-            
-            const typingTime = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
-            await delay(typingTime);
-            
+            await delay(Math.floor(Math.random() * 2000) + 3000);
             await sock.sendPresenceUpdate('paused', jid);
+            
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
             const timestamp = new Date().toISOString();
@@ -218,11 +207,8 @@ async function startBroadcastWorker(sock, deviceId) {
             await fbPatch(`sent_history/${deviceId}`, { [rawPhone]: { timestamp: timestamp } });
             await fbPatch(`devices/${deviceId}`, { sentToday: sentToday + 1, totalSent: (stats?.totalSent || 0) + 1, date: today, lastActive: timestamp, status: 'connected' });
 
-            console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
-            
-            const delayMs = getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes);
-            console.log(`[${deviceId}] ⏳ Waiting ${(delayMs / 60000).toFixed(1)} minutes before next message...`);
-            setTimeout(runWorker, delayMs);
+            console.log(`[${deviceId}] ✅ Message Sent to: ${phone}`);
+            setTimeout(runWorker, getRandomDelayMs(settings.minDelayMinutes, settings.maxDelayMinutes));
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Error:`, error.message);
@@ -242,7 +228,7 @@ async function startDevice(phoneNumberId) {
     console.log(`\n🔄 [${phoneNumberId}] Starting WhatsApp Engine...`);
 
     const sessionDir = `sessions_${phoneNumberId}`;
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
     
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
@@ -252,25 +238,26 @@ async function startDevice(phoneNumberId) {
         auth: state, 
         printQRInTerminal: false, 
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), 
+        browser: Browsers.ubuntu('Chrome'), // Keeps compatibility high
         syncFullHistory: false,
         qrTimeout: 50000,
         generateHighQualityLinkPreview: false
     });
 
-    activeSockets.set(phoneNumberId, sock); // Keep track of socket for zombie killing
+    activeSockets.set(phoneNumberId, sock);
 
+    // 🚀 NEW: Robust Pairing Code Logic
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
-            // 🟢 FIX 1: Ensure socket hasn't been closed/replaced before requesting code
-            if (activeSockets.get(phoneNumberId) !== sock) {
-                console.log(`[${phoneNumberId}] 🛑 Skipping Pairing Code Request (Socket replaced or closed)`);
-                return;
-            }
-
             try {
+                // Check if user cancelled request before timeout
+                const currentReq = await fbGet(`bot_requests/${phoneNumberId}`);
+                if (!currentReq) return;
+
                 let formattedNumber = formatPhoneNumberForPairing(phoneNumberId);
                 console.log(`[${phoneNumberId}] 📲 Requesting Pairing Code for: ${formattedNumber}...`);
+                
+                // Fetch Code
                 const pairingCode = await sock.requestPairingCode(formattedNumber);
                 console.log(`[${phoneNumberId}] 🔑 PAIRING CODE GENERATED: ${pairingCode}`);
 
@@ -281,53 +268,48 @@ async function startDevice(phoneNumberId) {
                 });
             } catch (err) {
                 console.error(`[${phoneNumberId}] ❌ Pairing Code Error:`, err.message);
+                // If code fails, wipe session so next try works
+                activeSockets.delete(phoneNumberId);
+                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
             }
-        }, 3000); 
+        }, 5000); // 🕒 Increased delay to let WhatsApp Socket fully open
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // Handle QR if requested
+        // Handle QR Generation
         if (qr) {
             const qrApiLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
             console.log(`[${phoneNumberId}] 📷 NEW QR LINK GENERATED!`);
-            
             await fbPatch(`qrcodes/${phoneNumberId}`, { qr_link: qrApiLink, last_updated: new Date().toISOString() });
-            
-            await fbPatch(`bot_requests/${phoneNumberId}`, { 
-                qr: qrApiLink, 
-                status: 'waiting_for_scan_or_code',
-                last_updated: new Date().toISOString() 
-            });
+            await fbPatch(`bot_requests/${phoneNumberId}`, { qr: qrApiLink, status: 'waiting_for_scan_or_code', last_updated: new Date().toISOString() });
             await fbPatch(`devices/${phoneNumberId}`, { status: 'qr_ready' });
         }
         
+        // Handle Successful Connection
         if (connection === 'open') {
             const botNumber = sock.user.id.split(':')[0];
             console.log(`\n✅ [${phoneNumberId}] SUCCESSFULLY CONNECTED AS ${botNumber} ✅`);
             
             await fbDelete(`bot_requests/${phoneNumberId}`);
             await fbDelete(`qrcodes/${phoneNumberId}`);
-
             await fbPatch(`devices/${phoneNumberId}`, { status: 'connected', phone: botNumber, device_id: phoneNumberId, connected_at: new Date().toISOString() });
             
-            console.log(`[${phoneNumberId}] ⏳ Stabilizing WhatsApp encryption keys... waiting 10 seconds.`);
+            console.log(`[${phoneNumberId}] ⏳ Stabilizing WhatsApp keys... waiting 10 seconds.`);
             setTimeout(() => { startBroadcastWorker(sock, phoneNumberId); }, 10000);
         }
         
+        // Handle Disconnection / Error Handling
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const reason = statusCode || DisconnectReason.connectionClosed;
-            console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
+            console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason Code: ${reason}`);
             
-            if (reason === DisconnectReason.loggedOut || reason === 401) {
-                console.log(`[${phoneNumberId}] ❌ Logged out. Deleting session...`);
-                
-                // 🟢 FIX 2: Recreate folder immediately to prevent ENOENT crashes from async cred saves
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-                if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
+            // 🛑 401 (Logged out) OR 408 (Timeout - User took too long to put code) OR 500 (Bad Session)
+            if (reason === DisconnectReason.loggedOut || reason === 401 || reason === 408 || reason === 405 || reason === 500) {
+                console.log(`[${phoneNumberId}] ❌ Invalid Session/Logged out. Wiping clean...`);
+                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
                 activeSockets.delete(phoneNumberId);
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
@@ -345,7 +327,7 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🔄 DYNAMIC SYSTEM POLLING
+// 🔄 DYNAMIC SYSTEM POLLING (FIXED FOR FRESH RE-REQUESTS)
 // ==========================================
 async function pollFirebaseForDevices() {
     console.log("🚀 Botzmine Task System Started! Listening for users...");
@@ -355,25 +337,37 @@ async function pollFirebaseForDevices() {
         if (requests) {
             for (const phoneId in requests) {
                 const reqData = requests[phoneId];
+                
+                // If User requests new code (status is pending or new request)
                 if ((reqData.action === 'generate_qr' || reqData.action === 'generate_code') && reqData.status !== 'waiting_for_scan_or_code' && reqData.status !== 'processing') {
-                    const sessionDir = `sessions_${phoneId}`;
+                    console.log(`\n🧹 [${phoneId}] NEW REQUEST RECEIVED! Wiping old session data completely...`);
                     
+                    // 1. Kill Active Connection
                     if (activeSockets.has(phoneId)) {
-                        console.log(`[${phoneId}] 🛑 Killing old background socket to prevent conflicts...`);
                         const oldSock = activeSockets.get(phoneId);
                         if (oldSock && oldSock.ws) {
-                            oldSock.ws.close(); 
+                            try { oldSock.ws.close(); } catch(e) {}
                         }
                         activeSockets.delete(phoneId);
                     }
 
+                    // 2. Add small delay to let Node.js release files
+                    await delay(1000);
+
+                    // 3. Force Delete Directory
+                    const sessionDir = `sessions_${phoneId}`;
                     if (fs.existsSync(sessionDir)) {
-                        console.log(`[${phoneId}] 🧹 Cleaning old session data before new pairing code...`);
-                        fs.rmSync(sessionDir, { recursive: true, force: true });
-                        // 🟢 FIX 3: Ensure folder exists so initialize phase doesn't crash
-                        fs.mkdirSync(sessionDir, { recursive: true });
+                        try {
+                            fs.rmSync(sessionDir, { recursive: true, force: true });
+                            console.log(`[${phoneId}] 🗑️ Old session folder deleted successfully.`);
+                        } catch(err) {
+                            console.log(`[${phoneId}] ⚠️ Could not delete session folder immediately.`);
+                        }
                     }
 
+                    await delay(500); // Give filesystem time to breathe
+                    
+                    // 4. Update Status and Start Fresh
                     await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
                     startDevice(phoneId);
                 }
@@ -409,7 +403,7 @@ setInterval(() => {
 // 🚀 INITIALIZATION WRAPPED IN TRY-CATCH
 // ==========================================
 if (!FIREBASE_URL) { 
-    console.error("❌ FIREBASE_URL is missing in .env file! Bot logic will not run, but web server remains online.");
+    console.error("❌ FIREBASE_URL is missing in .env file!");
 } else {
     try {
         pollFirebaseForDevices();
