@@ -1,223 +1,487 @@
-require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const fs = require('fs');
-const http = require('http');
+/**
+ * ============================================================
+ *  WhatsApp Bot — @whiskeysockets/baileys + Firebase RTDB
+ *  Production-Ready | Pairing Code Fix | 24/7 Broadcast Worker
+ * ============================================================
+ *
+ *  INSTALL DEPENDENCIES:
+ *    npm install @whiskeysockets/baileys firebase-admin qrcode axios
+ *
+ *  ENV VARS REQUIRED:
+ *    PORT                  — HTTP keep-alive port (e.g. 3000)
+ *    FIREBASE_DATABASE_URL — e.g. https://your-app.firebaseio.com
+ *    GOOGLE_APPLICATION_CREDENTIALS — path to serviceAccountKey.json
+ *      OR set FIREBASE_SERVICE_ACCOUNT as a JSON string in env
+ */
 
-// ==========================================
-// 🌐 ANTI-CRASH & SERVER
-// ==========================================
-process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Exception: ', err.message));
-process.on('unhandledRejection', (reason) => console.error('[ANTI-CRASH] Rejection: ', reason));
+'use strict';
 
-const FIREBASE_URL = process.env.FIREBASE_URL?.replace(/\/$/, "");
-const activeSockets = new Map();
+// ─── Core Imports ────────────────────────────────────────────
+const http        = require('http');
+const fs          = require('fs');
+const path        = require('path');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  Browsers,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  makeInMemoryStore,
+}                 = require('@whiskeysockets/baileys');
+const admin       = require('firebase-admin');
+const { Boom }    = require('@hapi/boom');
+const P           = require('pino');
 
-http.createServer((req, res) => { res.writeHead(200); res.end('Bot Running! 🚀'); }).listen(process.env.PORT || 3000);
+// ─── Anti-Crash Handlers ─────────────────────────────────────
+process.on('uncaughtException',  (err) => console.error('[CRASH GUARD] uncaughtException:', err));
+process.on('unhandledRejection', (err) => console.error('[CRASH GUARD] unhandledRejection:', err));
 
-// ==========================================
-// 🛠️ FIREBASE UTILITIES
-// ==========================================
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// ─── Firebase Init ───────────────────────────────────────────
+function initFirebase() {
+  if (admin.apps.length) return; // already initialized
 
-async function fbGet(path) { try { const res = await fetch(`${FIREBASE_URL}/${path}.json`); return res.ok ? await res.json() : null; } catch(e) { return null; } }
-async function fbPatch(path, data) { try { await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'PATCH', body: JSON.stringify(data) }); } catch(e) {} }
-async function fbDelete(path) { try { await fetch(`${FIREBASE_URL}/${path}.json`, { method: 'DELETE' }); } catch(e) {} }
+  let credential;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // Env var contains the raw JSON string of the service account
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    credential = admin.credential.cert(serviceAccount);
+  } else {
+    // Falls back to GOOGLE_APPLICATION_CREDENTIALS file path
+    credential = admin.credential.applicationDefault();
+  }
 
-// 🛑 100% ACCURATE NUMBER FORMATTER (FIX FOR "COULDN'T LINK DEVICE")
-function formatPhoneForWhatsApp(phone) {
-    let num = phone.toString().replace(/[^0-9]/g, ''); // صرف نمبرز رکھے گا
-    if (num.startsWith('00')) num = num.substring(2);
-    if (num.startsWith('03')) num = '92' + num.substring(1); // 0300 -> 92300
-    if (num.length === 10 && num.startsWith('3')) num = '92' + num; // 300 -> 92300
-    return num;
+  admin.initializeApp({
+    credential,
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
+  });
+
+  console.log('[Firebase] Initialized successfully.');
 }
 
-// ==========================================
-// 🚀 24/7 BROADCAST WORKER
-// ==========================================
-async function getNextNumber() {
-    const numbers = await fbGet('numbers');
-    if (!numbers) return null;
-    let foundPhone = null;
-    for (const phone in numbers) { if (!numbers[phone].status || numbers[phone].status === 'pending') { foundPhone = phone; break; } }
-    if (foundPhone) return foundPhone;
+initFirebase();
+const db = admin.database();
 
-    console.log(`♻️ All messages sent! Resetting list...`);
-    const updates = {};
-    for (const phone in numbers) updates[phone] = { status: 'pending' };
-    await fbPatch('numbers', updates);
-    return await getNextNumber();
+// ─── Helpers ─────────────────────────────────────────────────
+
+/**
+ * Sanitize a phone number to international format without '+'.
+ * Converts Pakistani 03xx → 923xx, strips spaces, dashes, +.
+ * @param {string} raw
+ * @returns {string}
+ */
+function sanitizePhone(raw) {
+  let num = String(raw).replace(/[^0-9]/g, ''); // digits only
+  // Pakistani local format: 03xxxxxxxxx → 923xxxxxxxxx
+  if (num.startsWith('0') && num.length === 11) {
+    num = '92' + num.slice(1);
+  }
+  return num;
 }
 
-async function startBroadcastWorker(sock, deviceId) {
-    console.log(`[${deviceId}] 🟢 24/7 Broadcast Worker Started!`);
-    
-    const runWorker = async () => {
-        try {
-            let settings = await fbGet('settings');
-            let messageTemplate = settings?.messageTemplate || "Hello from Botzmine!";
-            let rawPhone = await getNextNumber();
-            
-            if (!rawPhone) {
-                setTimeout(runWorker, 60 * 1000); 
-                return;
-            }
-            
-            const phone = rawPhone.replace(/\D/g, '');
-            const jid = `${phone}@s.whatsapp.net`;
-            
-            const waStatus = await sock.onWhatsApp(jid);
-            if (waStatus && waStatus[0]?.exists) {
-                await sock.presenceSubscribe(jid);
-                await sock.sendPresenceUpdate('composing', jid);
-                await delay(3000);
-                await sock.sendPresenceUpdate('paused', jid);
-                await sock.sendMessage(jid, { text: messageTemplate });
-                
-                await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp: new Date().toISOString() });
-                console.log(`[${deviceId}] ✅ Message Sent to: ${phone}`);
-            } else {
-                await fbPatch(`numbers/${rawPhone}`, { status: 'skipped' });
-            }
-            
-            console.log(`[${deviceId}] ⏳ Waiting 20 minutes...`);
-            setTimeout(runWorker, 20 * 60 * 1000); // 20 منٹ کا وقفہ
-        } catch (error) {
-            setTimeout(runWorker, 15 * 1000); 
-        }
-    };
-    runWorker();
+/**
+ * Recursively delete a directory synchronously.
+ * @param {string} dirPath
+ */
+function deleteDirSync(dirPath) {
+  if (!fs.existsSync(dirPath)) return;
+  fs.rmSync(dirPath, { recursive: true, force: true });
+  console.log(`[Session] Deleted: ${dirPath}`);
 }
 
-// ==========================================
-// 📱 DYNAMIC DEVICE MANAGER (THE ULTIMATE FIX)
-// ==========================================
-async function startDevice(userProvidedNumber) {
-    // 1. نمبر کو 100% واٹس ایپ کے فارمیٹ میں کنورٹ کریں
-    const exactWhatsAppNumber = formatPhoneForWhatsApp(userProvidedNumber);
-    const sessionDir = `sessions_${exactWhatsAppNumber}`;
+/**
+ * Sleep for ms milliseconds.
+ * @param {number} ms
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    console.log(`\n🔄 [${exactWhatsAppNumber}] Starting WhatsApp Connection...`);
+/**
+ * Build a QR image URL from a string using api.qrserver.com.
+ * @param {string} data
+ * @returns {string}
+ */
+function buildQRUrl(data) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data)}`;
+}
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
-    
-    const sock = makeWASocket({
-        version, 
-        auth: state, 
-        printQRInTerminal: false, 
-        logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), // براؤزر کو سٹیبل رکھا گیا ہے
-        syncFullHistory: false
+// ─── Active Sessions Map ──────────────────────────────────────
+// Tracks active socket instances keyed by phone number
+const activeSessions = new Map();
+
+// ─── Session Directory Helper ─────────────────────────────────
+function sessionDir(phoneNumber) {
+  return path.join(__dirname, `sessions_${phoneNumber}`);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CORE: Start a WhatsApp connection for a given phone number
+// ═══════════════════════════════════════════════════════════════
+async function startConnection(phoneNumber, requestData = {}) {
+  const phone   = sanitizePhone(phoneNumber);
+  const sessDir = sessionDir(phone);
+
+  console.log(`\n[Bot] Starting connection for: ${phone}`);
+
+  // ── STEP 1: Wipe old dirty session ───────────────────────────
+  deleteDirSync(sessDir);
+  console.log(`[Session] Clean slate for ${phone}`);
+
+  // ── STEP 2: Auth state setup ──────────────────────────────────
+  const { state, saveCreds } = await useMultiFileAuthState(sessDir);
+
+  // ── STEP 3: Fetch latest Baileys WA version ───────────────────
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`[Baileys] Using WA v${version.join('.')} — Latest: ${isLatest}`);
+
+  // ── STEP 4: Create socket ─────────────────────────────────────
+  const sock = makeWASocket({
+    version,
+    auth: {
+      creds: state.creds,
+      keys : makeCacheableSignalKeyStore(state.keys, P({ level: 'silent' })),
+    },
+    // ▶ Ubuntu/Chrome browser fingerprint prevents WA from rejecting pairing
+    browser           : Browsers.ubuntu('Chrome'),
+    printQRInTerminal : false,       // we handle QR ourselves
+    logger            : P({ level: 'silent' }), // silence noisy logs
+    syncFullHistory   : false,
+    markOnlineOnConnect: true,
+    connectTimeoutMs  : 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    keepAliveIntervalMs: 25_000,
+    retryRequestDelayMs: 2_000,
+  });
+
+  // Store reference so broadcast worker can use it
+  activeSessions.set(phone, sock);
+
+  // ── STEP 5: Wait for WS to stabilize BEFORE requesting pairing ─
+  //    This is the critical fix for "Couldn't link device"
+  const PAIRING_DELAY_MS = 4000; // 4 seconds — safe window
+  console.log(`[Pairing] Waiting ${PAIRING_DELAY_MS}ms for connection to stabilize…`);
+  await sleep(PAIRING_DELAY_MS);
+
+  // ── STEP 6: Request Pairing Code (if not already registered) ──
+  let pairingCode = null;
+  if (!sock.authState.creds.registered) {
+    try {
+      pairingCode = await sock.requestPairingCode(phone);
+      pairingCode = pairingCode?.match(/.{1,4}/g)?.join('-') ?? pairingCode; // format: XXXX-XXXX
+      console.log(`[Pairing] Code for ${phone}: ${pairingCode}`);
+    } catch (err) {
+      console.error(`[Pairing] Failed to get pairing code for ${phone}:`, err.message);
+    }
+  }
+
+  // ── STEP 7: Generate QR code URL (using a temp QR data string) ─
+  //    We use the phone number as the QR payload placeholder; in real
+  //    Baileys flow the QR event provides the actual scan string.
+  let qrUrl = null;
+
+  // ── STEP 8: Listen for QR event (for qr-based flow) ──────────
+  sock.ev.on('connection.update', async (update) => {
+    const { qr } = update;
+    if (qr) {
+      qrUrl = buildQRUrl(qr);
+      console.log(`[QR] Generated QR URL for ${phone}`);
+
+      // Save BOTH pairing code + QR to Firebase simultaneously
+      await db.ref(`bot_requests/${phone}`).update({
+        pairing_code : pairingCode,
+        qr_url       : qrUrl,
+        status       : 'code_ready',
+        updated_at   : Date.now(),
+      });
+    }
+  });
+
+  // Save pairing code to Firebase right away (even before QR appears)
+  if (pairingCode) {
+    await db.ref(`bot_requests/${phone}`).update({
+      pairing_code : pairingCode,
+      status       : 'code_ready',
+      updated_at   : Date.now(),
     });
+  }
 
-    activeSockets.set(exactWhatsAppNumber, sock);
+  // ── STEP 9: Main connection event handler ──────────────────────
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect } = update;
 
-    // 🛑 PAIRING CODE LOGIC (100% ERROR FREE)
-    if (!sock.authState.creds.registered) {
-        // ساکٹ کو پوری طرح اوپن ہونے کے لیے 4 سیکنڈ کا ٹائم دیں
-        setTimeout(async () => {
-            try {
-                console.log(`[${exactWhatsAppNumber}] 📲 Requesting Pairing Code from WhatsApp Servers...`);
-                // واٹس ایپ سے بالکل ایگزیکٹ نمبر کے لیے کوڈ مانگیں
-                const pairingCode = await sock.requestPairingCode(exactWhatsAppNumber);
-                console.log(`[${exactWhatsAppNumber}] 🔑 SUCCESS! NEW PAIRING CODE: ${pairingCode}`);
+    // ── CONNECTED ────────────────────────────────────────────────
+    if (connection === 'open') {
+      const botNumber = sock.user?.id?.split(':')[0] ?? phone;
+      console.log(`[Bot] ✅ Connected: ${botNumber}`);
 
-                // ڈیٹا بیس میں کوڈ اپڈیٹ کریں
-                await fbPatch(`bot_requests/${userProvidedNumber}`, { 
-                    pairingCode: pairingCode,
-                    status: 'waiting_for_scan_or_code'
-                });
-            } catch (err) {
-                console.error(`[${exactWhatsAppNumber}] ❌ Failed to get code:`, err.message);
-            }
-        }, 4000); // 4 سیکنڈ کا ڈیلے بہت ضروری ہے
+      // Remove from bot_requests (request fulfilled)
+      await db.ref(`bot_requests/${phone}`).remove();
+
+      // Save device record
+      await db.ref(`devices/${phone}`).set({
+        status     : 'connected',
+        phone      : botNumber,
+        connected_at: Date.now(),
+      });
+
+      // Start broadcast worker after 5-second grace period
+      console.log(`[Broadcast] Starting worker for ${phone} in 5s…`);
+      await sleep(5000);
+      startBroadcastWorker(phone, sock);
     }
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        // QR Code
-        if (qr && !sock.authState.creds.registered) {
-            const qrLink = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
-            await fbPatch(`bot_requests/${userProvidedNumber}`, { qr: qrLink });
-        }
-        
-        // ✅ CONECTED SUCCESSFULLY
-        if (connection === 'open') {
-            const botNumber = sock.user.id.split(':')[0];
-            console.log(`\n🎉 [${exactWhatsAppNumber}] CONNECTED SUCCESSFULLY AS ${botNumber} 🎉`);
-            
-            await fbDelete(`bot_requests/${userProvidedNumber}`);
-            await fbPatch(`devices/${userProvidedNumber}`, { status: 'connected', phone: botNumber });
-            
-            setTimeout(() => { startBroadcastWorker(sock, userProvidedNumber); }, 5000);
-        }
-        
-        // ❌ DISCONNECTED OR ERROR
-        if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            console.log(`[${exactWhatsAppNumber}] ⚠️ Disconnected. Reason: ${reason}`);
-            
-            if (reason === DisconnectReason.loggedOut || reason === 401 || reason === 408 || reason === 500) {
-                console.log(`[${exactWhatsAppNumber}] 🧹 Deleting corrupt session...`);
-                activeSockets.delete(exactWhatsAppNumber);
-                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e){}
-                await fbPatch(`devices/${userProvidedNumber}`, { status: 'disconnected' });
-            } else {
-                activeSockets.delete(exactWhatsAppNumber); 
-                setTimeout(() => startDevice(userProvidedNumber), 5000);
-            }
-        }
-    });
-    
-    sock.ev.on('creds.update', saveCreds);
+    // ── DISCONNECTED ──────────────────────────────────────────────
+    if (connection === 'close') {
+      const statusCode = (lastDisconnect?.error instanceof Boom)
+        ? lastDisconnect.error.output?.statusCode
+        : null;
+
+      console.warn(`[Bot] ⚠️ Disconnected for ${phone} — Code: ${statusCode}`);
+
+      const fatalCodes = [
+        DisconnectReason.loggedOut,          // 401
+        DisconnectReason.badSession,         // 500
+        DisconnectReason.connectionReplaced, // 440
+      ];
+
+      const isFatal = fatalCodes.includes(statusCode);
+
+      if (isFatal) {
+        // ── Fatal: wipe session, mark device disconnected ────────
+        console.error(`[Bot] 🔴 Fatal disconnect for ${phone}. Wiping session.`);
+        activeSessions.delete(phone);
+        deleteDirSync(sessionDir(phone));
+
+        await db.ref(`devices/${phone}`).update({
+          status       : 'disconnected',
+          disconnected_at: Date.now(),
+          error_code   : statusCode,
+        });
+      } else {
+        // ── Non-fatal: attempt reconnect ─────────────────────────
+        console.log(`[Bot] 🔄 Reconnecting for ${phone} in 5s…`);
+        await sleep(5000);
+        startConnection(phone);
+      }
+    }
+  });
+
+  // ── STEP 10: Save credentials on update ───────────────────────
+  sock.ev.on('creds.update', saveCreds);
+
+  return sock;
 }
 
-// ==========================================
-// 🔄 DATABASE POLLER
-// ==========================================
+// ═══════════════════════════════════════════════════════════════
+//  BROADCAST WORKER — Sends messages 24/7 with 20-min intervals
+// ═══════════════════════════════════════════════════════════════
+async function startBroadcastWorker(phone, sock) {
+  console.log(`[Broadcast] Worker started for ${phone}`);
+
+  // Recursive async loop — runs forever
+  async function runLoop() {
+    try {
+      // ── Fetch message template from settings ──────────────────
+      const settingsSnap = await db.ref('settings').once('value');
+      const settings     = settingsSnap.val() ?? {};
+      const template     = settings.message_template ?? 'Hello! This is a broadcast message.';
+
+      // ── Fetch pending numbers ─────────────────────────────────
+      const numbersSnap = await db.ref('numbers').orderByChild('status').equalTo('pending').once('value');
+      const numbersData = numbersSnap.val();
+
+      if (!numbersData) {
+        // No pending numbers — reset all to pending and loop again
+        console.log(`[Broadcast] No pending numbers. Resetting all to pending…`);
+        await resetAllNumbersToPending();
+        // Small delay before re-looping to avoid hammering Firebase
+        await sleep(10_000);
+        runLoop();
+        return;
+      }
+
+      const entries = Object.entries(numbersData); // [[key, {number, status}], ...]
+
+      console.log(`[Broadcast] Found ${entries.length} pending number(s) for ${phone}`);
+
+      // ── Send to each number one by one with 20-min intervals ──
+      for (const [key, record] of entries) {
+        // Safety check: is socket still alive?
+        if (!activeSessions.has(phone)) {
+          console.warn(`[Broadcast] Socket gone for ${phone}. Stopping worker.`);
+          return;
+        }
+
+        const targetNumber = sanitizePhone(record.number ?? record.phone ?? key);
+        const jid          = `${targetNumber}@s.whatsapp.net`;
+
+        // Personalize message if template supports it
+        const message = template
+          .replace(/\{name\}/gi,   record.name   ?? '')
+          .replace(/\{number\}/gi, targetNumber);
+
+        try {
+          await sock.sendMessage(jid, { text: message });
+          console.log(`[Broadcast] ✅ Sent to ${targetNumber}`);
+
+          // Mark number as sent in Firebase
+          await db.ref(`numbers/${key}`).update({
+            status  : 'sent',
+            sent_at : Date.now(),
+            sent_by : phone,
+          });
+        } catch (sendErr) {
+          console.error(`[Broadcast] ❌ Failed to send to ${targetNumber}:`, sendErr.message);
+          // Mark as failed but continue with others
+          await db.ref(`numbers/${key}`).update({
+            status  : 'failed',
+            error   : sendErr.message,
+            failed_at: Date.now(),
+          });
+        }
+
+        // ── 20-minute wait before next message ────────────────────
+        const INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
+        console.log(`[Broadcast] ⏳ Waiting 20 minutes before next message…`);
+        await sleep(INTERVAL_MS);
+      }
+
+      // All numbers processed — loop back immediately (reset handled at top)
+      console.log(`[Broadcast] All numbers processed. Looping…`);
+      runLoop();
+
+    } catch (err) {
+      console.error(`[Broadcast] Worker error for ${phone}:`, err.message);
+      // Wait 30 seconds then retry
+      await sleep(30_000);
+      runLoop();
+    }
+  }
+
+  runLoop(); // kick off
+}
+
+/**
+ * Reset all numbers back to 'pending' so the broadcast loop continues forever.
+ */
+async function resetAllNumbersToPending() {
+  const snap = await db.ref('numbers').once('value');
+  const data = snap.val();
+  if (!data) return;
+
+  const updates = {};
+  for (const key of Object.keys(data)) {
+    updates[`numbers/${key}/status`] = 'pending';
+    updates[`numbers/${key}/reset_at`] = Date.now();
+  }
+  await db.ref().update(updates);
+  console.log('[Broadcast] All numbers reset to pending.');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  FIREBASE POLLER — Checks for new pairing/QR requests
+// ═══════════════════════════════════════════════════════════════
 async function pollFirebase() {
-    console.log("🚀 System Ready! Waiting for user to add number...");
-    
-    const check = async () => {
-        let requests = await fbGet('bot_requests');
-        if (requests) {
-            for (const phoneId in requests) {
-                const req = requests[phoneId];
-                if ((req.action === 'generate_qr' || req.action === 'generate_code') && req.status !== 'waiting_for_scan_or_code' && req.status !== 'processing') {
-                    
-                    const exactWhatsAppNumber = formatPhoneForWhatsApp(phoneId);
-                    
-                    // 🛑 سب سے اہم حصہ: پرانا کچرا مکمل ڈیلیٹ کرنا
-                    if (activeSockets.has(exactWhatsAppNumber)) {
-                        try { activeSockets.get(exactWhatsAppNumber).ws.close(); } catch(e) {}
-                        activeSockets.delete(exactWhatsAppNumber);
-                    }
-                    
-                    // پرانا فولڈر فوراً اڑا دیں تاکہ واٹس ایپ ایرر نہ دے
-                    try { fs.rmSync(`sessions_${exactWhatsAppNumber}`, { recursive: true, force: true }); } catch(e){}
-                    
-                    await fbPatch(`bot_requests/${phoneId}`, { status: 'processing' });
-                    
-                    // 3 سیکنڈ کا وقفہ دے کر ڈیوائس سٹارٹ کریں تاکہ سسٹم فریش ہو جائے
-                    setTimeout(() => { startDevice(phoneId); }, 3000);
-                }
-            }
-        }
+  try {
+    const snap = await db.ref('bot_requests').once('value');
+    const requests = snap.val();
 
-        let devices = await fbGet('devices');
-        if (devices) {
-            for (const id in devices) {
-                if (devices[id].status === 'connected' && !activeSockets.has(formatPhoneForWhatsApp(id))) {
-                    startDevice(id); 
-                }
-            }
-        }
-    };
-    check();
-    setInterval(check, 4000);
+    if (!requests) return;
+
+    for (const [phone, data] of Object.entries(requests)) {
+      const action = data?.action;
+
+      // Only handle new, unprocessed requests
+      if (action !== 'generate_code' && action !== 'generate_qr') continue;
+      if (data?.status === 'code_ready' || data?.status === 'processing') continue;
+
+      console.log(`[Poller] New request — Phone: ${phone}, Action: ${action}`);
+
+      // Mark as processing immediately to prevent duplicate handling
+      await db.ref(`bot_requests/${phone}`).update({
+        status    : 'processing',
+        updated_at: Date.now(),
+      });
+
+      // Don't await — let each connection run independently
+      startConnection(phone, data).catch((err) => {
+        console.error(`[Poller] startConnection failed for ${phone}:`, err.message);
+        db.ref(`bot_requests/${phone}`).update({ status: 'error', error: err.message });
+      });
+    }
+  } catch (err) {
+    console.error('[Poller] Firebase poll error:', err.message);
+  }
 }
 
-if (FIREBASE_URL) pollFirebase(); else console.log("❌ FIREBASE_URL missing!");
+// Start polling every 4 seconds
+const POLL_INTERVAL_MS = 4000;
+setInterval(pollFirebase, POLL_INTERVAL_MS);
+console.log(`[Poller] Firebase polling started (every ${POLL_INTERVAL_MS}ms)`);
+
+// ── Also reconnect already-connected devices on server restart ─
+async function reconnectExistingDevices() {
+  try {
+    const snap = await db.ref('devices').orderByChild('status').equalTo('connected').once('value');
+    const devices = snap.val();
+    if (!devices) return;
+
+    for (const phone of Object.keys(devices)) {
+      const sessDir = sessionDir(phone);
+      if (fs.existsSync(sessDir)) {
+        console.log(`[Boot] Reconnecting existing device: ${phone}`);
+        startConnection(phone).catch(console.error);
+        await sleep(3000); // stagger reconnects
+      }
+    }
+  } catch (err) {
+    console.error('[Boot] Could not reconnect existing devices:', err.message);
+  }
+}
+
+reconnectExistingDevices();
+
+// ═══════════════════════════════════════════════════════════════
+//  HTTP KEEP-ALIVE SERVER (for Render / Railway / Heroku etc.)
+// ═══════════════════════════════════════════════════════════════
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status   : 'running',
+    sessions : activeSessions.size,
+    uptime   : process.uptime(),
+    timestamp: new Date().toISOString(),
+  }));
+}).listen(PORT, () => {
+  console.log(`[Server] HTTP keep-alive listening on port ${PORT}`);
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  FIREBASE DATABASE STRUCTURE (reference)
+// ═══════════════════════════════════════════════════════════════
+/*
+  bot_requests/
+    <phoneNumber>/
+      action    : "generate_code" | "generate_qr"
+      status    : "pending" | "processing" | "code_ready" | "error"
+      pairing_code: "XXXX-XXXX"        ← written by bot
+      qr_url    : "https://..."        ← written by bot
+      updated_at: 1700000000000
+
+  devices/
+    <phoneNumber>/
+      status      : "connected" | "disconnected"
+      phone       : "923001234567"
+      connected_at: 1700000000000
+
+  numbers/
+    <key>/
+      number  : "923001234567"
+      name    : "John"          (optional)
+      status  : "pending" | "sent" | "failed"
+      sent_at : 1700000000000   (written by bot)
+
+  settings/
+    message_template: "Hello {name}! This is your message."
+*/
