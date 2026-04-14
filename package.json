@@ -1,18 +1,14 @@
 {
-  "name": "whatsapp-bot",
+  "name": "w-broadcaster-bot",
   "version": "1.0.0",
-  "description": "Production WhatsApp Bot — Baileys + Firebase RTDB",
+  "description": "Multi-Device WhatsApp SaaS Broadcaster",
   "main": "index.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.9",
-    "firebase-admin": "^12.0.0",
-    "pino": "^8.19.0"
+    "@whiskeysockets/baileys": "^6.7.0",
+    "pino": "^8.19.0",
+    "dotenv": "^16.4.5"
   }
 }
