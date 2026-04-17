@@ -122,7 +122,6 @@ async function getAndLockNextNumber(deviceId) {
     for (const phone in numbers) {
         const status = numbers[phone].status;
         
-        // صرف وہ نمبر اٹھائے گا جو pending ہے یا جس کا اسٹیٹس نہیں ہے۔
         if (!status || status === 'pending') {
             foundPhone = phone;
             break; 
@@ -130,12 +129,10 @@ async function getAndLockNextNumber(deviceId) {
     }
 
     if (foundPhone) {
-        // 🔒 فوراً processing پر سیٹ کریں تاکہ کوئی اور لوپ اسے نہ پکڑے
         await fbPatch(`numbers/${foundPhone}`, { status: 'processing', pickedBy: deviceId });
         return foundPhone;
     }
 
-    // اگر تمام نمبرز ختم ہو جائیں تو دوبارہ ری سیٹ کر دے
     if (hasAnyNumber) {
         console.log(`\n♻️ [AUTO-LOOP] All targets finished! Resetting all numbers back to pending...\n`);
         const updates = {};
@@ -143,7 +140,7 @@ async function getAndLockNextNumber(deviceId) {
             updates[phone] = { status: 'pending', sentBy: null, timestamp: null, pickedBy: null };
         }
         await fbPatch('numbers', updates);
-        await delay(5000); // Wait before retrying
+        await delay(5000); 
         return await getAndLockNextNumber(deviceId);
     }
 
@@ -154,24 +151,20 @@ async function getAndLockNextNumber(deviceId) {
 // 🚀 UNLIMITED LIFETIME BROADCAST WORKER (7x24 HOURS)
 // ==========================================
 async function startBroadcastWorker(deviceId) {
-    // 🛑 Prevent multiple overlapping workers
     if (activeWorkers.has(deviceId)) return;
     activeWorkers.add(deviceId);
 
     console.log(`[${deviceId}] 🟢 24/7 Broadcast Worker activated! Running Unstoppable mode...`);
     
     while (true) {
-        let rawPhone = null; // Declare here so catch block can access it
+        let rawPhone = null; 
         
         try {
-            // 🛑 چیک کریں کہ ورکر کینسل تو نہیں کر دیا گیا (Logout کی صورت میں)
             if (!activeWorkers.has(deviceId)) {
                 console.log(`[${deviceId}] 🛑 Worker safely terminated.`);
                 break;
             }
 
-            // 🔥 ڈائنامک ساکٹ (Dynamic Socket) حاصل کریں: 
-            // اگر ساکٹ ری کنیکٹ ہوتا ہے تو یہ ہمیشہ نیا اور ایکٹیو ساکٹ ہی استعمال کرے گا
             const sock = activeSockets.get(deviceId);
             if (!sock || sock === 'initializing') {
                 console.log(`[${deviceId}] ⚠️ Socket not ready. Worker waiting 15s...`);
@@ -181,18 +174,16 @@ async function startBroadcastWorker(deviceId) {
 
             const settings = await getSettings();
             
-            // نمبر اٹھائیں اور لاک کریں
             rawPhone = await getAndLockNextNumber(deviceId);
             
             if (!rawPhone) {
-                await delay(15 * 1000); // کوئی نمبر نہیں ملا تو 15 سیکنڈ رکے گا
+                await delay(15 * 1000); 
                 continue;
             }
             
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
-            // Timeout preventer (اگر واٹس ایپ کا API فریز ہو جائے)
             const waStatus = await Promise.race([
                 sock.onWhatsApp(jid),
                 delay(10000).then(() => 'TIMEOUT') 
@@ -211,7 +202,6 @@ async function startBroadcastWorker(deviceId) {
             
             console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             
-            // Typing effect
             try {
                 await sock.presenceSubscribe(jid);
                 await sock.sendPresenceUpdate('composing', jid);
@@ -222,12 +212,10 @@ async function startBroadcastWorker(deviceId) {
                 console.log(`[${deviceId}] ⚠️ Presence update ignored (Privacy settings).`);
             }
             
-            // 📩 میسج بھیجنا
             await sock.sendMessage(jid, { text: settings.messageTemplate });
             
             const timestamp = new Date().toISOString();
             
-            // فائر بیس اپڈیٹ 
             await fbPatch(`numbers/${rawPhone}`, { status: 'sent', sentBy: deviceId, timestamp: timestamp, pickedBy: null });
             await fbPatch(`sent_history/${deviceId}`, { [rawPhone]: { timestamp: timestamp } });
             
@@ -236,19 +224,17 @@ async function startBroadcastWorker(deviceId) {
 
             console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
             
-            // ⏳ ٹھیک 20 منٹ کا ڈیلے (Anti-Ban safety)
             const delayMs = 20 * 60 * 1000; // 20 Minutes
             console.log(`[${deviceId}] ⏳ Waiting 20 minutes before sending the next message...`);
             await delay(delayMs);
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Loop Error:`, error.message);
-            // 🔄 اگر کوئی ایرر آئے تو نمبر کو واپس pending کر دے تاکہ ضائع نہ ہو
             if (rawPhone) {
                 console.log(`[${deviceId}] 🔄 Reverting ${rawPhone} back to pending due to error.`);
                 await fbPatch(`numbers/${rawPhone}`, { status: 'pending', pickedBy: null });
             }
-            await delay(15 * 1000); // Wait 15s on error before trying again
+            await delay(15 * 1000); 
         }
     }
 }
@@ -277,11 +263,10 @@ async function startDevice(phoneNumberId) {
         syncFullHistory: false,
         qrTimeout: 50000,
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 30000, // 💡 Keeps connection alive 24/7
+        keepAliveIntervalMs: 30000, 
         retryRequestDelayMs: 5000
     });
 
-    // 🔥 یہ ساکٹ اب ڈائنامک میپ میں سیو ہو گیا ہے جسے ورکر لوپ بار بار چیک کرے گا
     activeSockets.set(phoneNumberId, sock); 
 
     if (!sock.authState.creds.registered) {
@@ -326,7 +311,6 @@ async function startDevice(phoneNumberId) {
             
             console.log(`[${phoneNumberId}] ⏳ Stabilizing WhatsApp encryption keys...`);
             setTimeout(() => { 
-                // ورکر کو اسٹارٹ کریں (صرف ڈیوائس آئی ڈی پاس کریں، ساکٹ خود اٹھائے گا)
                 startBroadcastWorker(phoneNumberId); 
             }, 5000);
         }
@@ -337,17 +321,21 @@ async function startDevice(phoneNumberId) {
             console.log(`[${phoneNumberId}] ⚠️ Disconnected. Reason: ${reason}`);
             
             if (reason === DisconnectReason.loggedOut || reason === 401 || reason === 403) {
-                console.log(`[${phoneNumberId}] ❌ Logged out or Banned. Cleaning up...`);
-                fs.rmSync(sessionDir, { recursive: true, force: true });
+                console.log(`[${phoneNumberId}] ❌ Logged out or Banned. Cleaning up database and folders...`);
+                
+                // مکمل صفائی اگر لاگ آؤٹ ہو جائے
+                if (fs.existsSync(sessionDir)) {
+                    fs.rmSync(sessionDir, { recursive: true, force: true });
+                }
                 activeSockets.delete(phoneNumberId);
-                activeWorkers.delete(phoneNumberId); // 🛑 Stop the worker loop
+                activeWorkers.delete(phoneNumberId); 
+                
                 await fbDelete(`bot_requests/${phoneNumberId}`);
                 await fbDelete(`qrcodes/${phoneNumberId}`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'disconnected', phone: null });
             } else {
                 console.log(`[${phoneNumberId}] 🔄 Background Reconnecting...`);
                 await fbPatch(`devices/${phoneNumberId}`, { status: 'reconnecting' });
-                // ساکٹ کو میپ سے ہٹائیں، ری کنیکٹ ہونے پر نیا ساکٹ بن کر میپ میں اپڈیٹ ہو جائے گا
                 activeSockets.delete(phoneNumberId); 
                 setTimeout(() => startDevice(phoneNumberId), 5000);
             }
@@ -358,7 +346,7 @@ async function startDevice(phoneNumberId) {
 }
 
 // ==========================================
-// 🔄 DYNAMIC SYSTEM POLLING
+// 🔄 DYNAMIC SYSTEM POLLING (100% FRESH SESSION MANAGER)
 // ==========================================
 async function pollFirebaseForDevices() {
     console.log("🚀 Botzmine Task System Started! Listening for users...");
@@ -369,25 +357,38 @@ async function pollFirebaseForDevices() {
             for (const phoneId in requests) {
                 const reqData = requests[phoneId];
                 
+                // 🔥 یہاں میں نے زبردست صفائی کا سسٹم لگا دیا ہے
                 if (reqData.action === 'generate_qr' || reqData.action === 'generate_code') {
-                    console.log(`[${phoneId}] 🔄 New Pairing Request Received!`);
+                    console.log(`\n[${phoneId}] 🔄 FRESH Pairing Request Received! Wiping old data completely...`);
+                    
+                    // 1. سب سے پہلے اسٹیٹس اپڈیٹ کریں تاکہ لوپ نہ چلے
                     await fbPatch(`bot_requests/${phoneId}`, { action: 'processing', status: 'processing' });
 
-                    const sessionDir = `sessions_${phoneId}`;
-                    
+                    // 2. پرانے کنکشن کو فوراً کلوز کر دیں
                     if (activeSockets.has(phoneId)) {
-                        console.log(`[${phoneId}] 🛑 Killing old socket...`);
+                        console.log(`[${phoneId}] 🛑 Killing old socket in memory...`);
                         const oldSock = activeSockets.get(phoneId);
-                        if (oldSock && oldSock.ws) oldSock.ws.close(); 
+                        if (oldSock && oldSock.ws) {
+                            try { oldSock.ws.close(); } catch(e){}
+                        }
                         activeSockets.delete(phoneId);
                         activeWorkers.delete(phoneId);
                     }
 
+                    // 3. پرانے فولڈرز کو مکمل ڈیلیٹ کر دیں
+                    const sessionDir = `sessions_${phoneId}`;
                     if (fs.existsSync(sessionDir)) {
-                        console.log(`[${phoneId}] 🧹 Cleaning old session data...`);
+                        console.log(`[${phoneId}] 🧹 Deleting old local session files...`);
                         fs.rmSync(sessionDir, { recursive: true, force: true });
                     }
 
+                    // 4. ڈیٹا بیس (Firebase) سے پرانا کیو آر اور ڈیٹا صاف کر دیں
+                    console.log(`[${phoneId}] 🧹 Wiping old Firebase Records to prevent conflict...`);
+                    await fbDelete(`qrcodes/${phoneId}`);
+                    await fbPatch(`devices/${phoneId}`, { status: 'pending', phone: null });
+
+                    // 5. تھوڑا انتظار کریں تاکہ سسٹم ہر چیز کو فریش کر لے اور پھر نیا سٹارٹ کرے
+                    await delay(2000);
                     startDevice(phoneId);
                 }
             }
