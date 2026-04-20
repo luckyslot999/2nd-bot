@@ -141,7 +141,8 @@ async function getAndLockNextNumber(deviceId) {
         }
         await fbPatch('numbers', updates);
         await delay(5000); 
-        return await getAndLockNextNumber(deviceId);
+        // 🛡️ Error Fix: Returning null instead of recursion to prevent memory overflow
+        return null; 
     }
 
     return null; 
@@ -184,13 +185,14 @@ async function startBroadcastWorker(deviceId) {
             const phone = formatNumber(rawPhone);
             const jid = `${phone}@s.whatsapp.net`;
             
+            // 🛡️ ANTI-HANG: Force timeout if API is stuck
             const waStatus = await Promise.race([
-                sock.onWhatsApp(jid),
-                delay(10000).then(() => 'TIMEOUT') 
+                sock.onWhatsApp(jid).catch(() => null),
+                delay(15000).then(() => 'TIMEOUT') 
             ]);
 
             if (waStatus === 'TIMEOUT') {
-                throw new Error('WhatsApp API Timeout - Network issue or socket disconnected.');
+                throw new Error('WhatsApp API Timeout - Network issue or socket stuck.');
             }
 
             if (!waStatus || waStatus.length === 0 || !waStatus[0].exists) {
@@ -203,16 +205,27 @@ async function startBroadcastWorker(deviceId) {
             console.log(`[${deviceId}] ✍️ Sending message to ${phone}...`);
             
             try {
-                await sock.presenceSubscribe(jid);
-                await sock.sendPresenceUpdate('composing', jid);
-                const typingTime = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
+                // 🛡️ ANTI-HANG: Presence updates wrapped in timeout
+                await Promise.race([sock.presenceSubscribe(jid), delay(3000)]);
+                await Promise.race([sock.sendPresenceUpdate('composing', jid), delay(3000)]);
+                
+                const typingTime = Math.floor(Math.random() * (4000 - 2000 + 1)) + 2000;
                 await delay(typingTime);
-                await sock.sendPresenceUpdate('paused', jid);
+                
+                await Promise.race([sock.sendPresenceUpdate('paused', jid), delay(3000)]);
             } catch (e) {
                 console.log(`[${deviceId}] ⚠️ Presence update ignored (Privacy settings).`);
             }
             
-            await sock.sendMessage(jid, { text: settings.messageTemplate });
+            // 🛡️ ANTI-HANG: Message Sending with 30s strict timeout
+            const sendResult = await Promise.race([
+                sock.sendMessage(jid, { text: settings.messageTemplate }),
+                delay(30000).then(() => 'TIMEOUT')
+            ]);
+
+            if (sendResult === 'TIMEOUT') {
+                throw new Error('Message sending completely stuck. Forcing retry on next number.');
+            }
             
             const timestamp = new Date().toISOString();
             
@@ -224,9 +237,20 @@ async function startBroadcastWorker(deviceId) {
 
             console.log(`[${deviceId}] ✅ Message Sent Successfully to: ${phone}`);
             
-            const delayMs = 20 * 60 * 1000; // 20 Minutes
-            console.log(`[${deviceId}] ⏳ Waiting 20 minutes before sending the next message...`);
-            await delay(delayMs);
+            // 🕒 SMART DELAY (10 Minutes)
+            console.log(`[${deviceId}] ⏳ Waiting 10 minutes before sending the next message...`);
+            const waitTimeMs = 10 * 60 * 1000; // 10 Minutes
+            const chunkTimeMs = 10000; // 10 Seconds Chunk
+            
+            for (let w = 0; w < waitTimeMs; w += chunkTimeMs) {
+                if (!activeWorkers.has(deviceId)) break; // Stop if system kills worker
+                const currentSock = activeSockets.get(deviceId);
+                if (!currentSock || currentSock === 'initializing') {
+                    console.log(`[${deviceId}] ⚠️ Socket disconnected during wait. Breaking delay to reconnect...`);
+                    break;
+                }
+                await delay(chunkTimeMs);
+            }
             
         } catch (error) {
             console.log(`[${deviceId}] ❌ Worker Loop Error:`, error.message);
@@ -263,8 +287,9 @@ async function startDevice(phoneNumberId) {
         syncFullHistory: false,
         qrTimeout: 50000,
         generateHighQualityLinkPreview: false,
-        keepAliveIntervalMs: 30000, 
-        retryRequestDelayMs: 5000
+        keepAliveIntervalMs: 25000, // 🛡️ Keeps socket alive continuously
+        retryRequestDelayMs: 5000,
+        defaultQueryTimeoutMs: 60000 // 🛡️ Prevents silent Baileys crash
     });
 
     activeSockets.set(phoneNumberId, sock); 
